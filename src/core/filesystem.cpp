@@ -100,7 +100,7 @@ std::string VFS::normalize_path(const std::string& path) const {
 bool VFS::mount(const std::filesystem::path& physical_path, const std::string& virtual_path) {
     auto abs_path = std::filesystem::absolute(physical_path);
     if (!std::filesystem::exists(abs_path) || !std::filesystem::is_directory(abs_path)) {
-        log_error("Mount path does not exist or is not a directory: {}", abs_path.string());
+        LOG_ERROR("Mount path does not exist or is not a directory: {}", abs_path.string());
         return false;
     }
     
@@ -116,13 +116,13 @@ bool VFS::mount(const std::filesystem::path& physical_path, const std::string& v
     std::sort(mounts_.begin(), mounts_.end(), 
               [](const MountPoint& a, const MountPoint& b) { return a.priority > b.priority; });
     
-    log_info("Mounted: {} -> {}", abs_path.string(), virtual_path);
+    LOG_INFO("Mounted: {} -> {}", abs_path.string(), virtual_path);
     return true;
 }
 
 bool VFS::mount_bin(const std::filesystem::path& bin_path, const std::string& virtual_path) {
     // TODO: 实现 .bin 容器挂载 (需要 BinParser 支持)
-    log_warn("BIN container mount not yet implemented: {}", bin_path.string());
+    LOG_WARN("BIN container mount not yet implemented: {}", bin_path.string());
     return false;
 }
 
@@ -171,13 +171,13 @@ std::optional<std::filesystem::path> VFS::find_file(const std::string& virtual_p
 std::unique_ptr<FileHandle> VFS::open_read(const std::string& virtual_path) {
     auto physical = find_file(virtual_path);
     if (!physical) {
-        log_debug("File not found in VFS: {}", virtual_path);
+        LOG_DEBUG("File not found in VFS: {}", virtual_path);
         return nullptr;
     }
     
     auto handle = std::make_unique<PhysicalFileHandle>(*physical, std::ios::in);
     if (!handle->is_valid()) {
-        log_error("Failed to open file: {}", physical->string());
+        LOG_ERROR("Failed to open file: {}", physical->string());
         return nullptr;
     }
     return handle;
@@ -193,7 +193,7 @@ std::unique_ptr<FileHandle> VFS::open_write(const std::string& virtual_path, boo
     auto mode = std::ios::out | (append ? std::ios::app : std::ios::trunc);
     auto handle = std::make_unique<PhysicalFileHandle>(full_path, mode);
     if (!handle->is_valid()) {
-        log_error("Failed to create file: {}", full_path.string());
+        LOG_ERROR("Failed to create file: {}", full_path.string());
         return nullptr;
     }
     return handle;

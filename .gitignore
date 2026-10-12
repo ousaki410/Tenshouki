@@ -1,4 +1,6 @@
+# Build directories
 build/
+build_*/
 *.o
 *.obj
 *.exe
@@ -6,5 +8,37 @@ build/
 *.dll
 *.so
 *.dylib
+
+# Logs
 tensyoki.log
+test.log
+
+# Extracted resources
 extracted/
+
+# Game assets (too large for git)
+NATWPUKHDV-ALI213.rar
+tensyoki_extracted/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.ninja
+
+# Testing
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Sanitizers
+asan_log.txt

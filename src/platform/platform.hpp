@@ -24,6 +24,7 @@ public:
         bool vsync = true;
         bool high_dpi = true;
         bool borderless = false;
+        int msaa_samples = 0;
         std::string icon_path;  // 窗口图标
     };
     

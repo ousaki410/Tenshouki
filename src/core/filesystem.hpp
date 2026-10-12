@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <fstream>
 #include <cstdint>
+#include <optional>
 
 namespace tensyoki {
 

@@ -3,16 +3,16 @@
  */
 
 #include "gtest/gtest.h"
-#include "resource/bin_parser.hpp"
-#include "core/filesystem.hpp"
-#include "core/logging.hpp"
+#include "bin_parser.hpp"
+#include "filesystem.hpp"
+#include "logging.hpp"
 #include <filesystem>
 #include <fstream>
 
 namespace tensyoki {
 namespace test {
 
-class BinParserTest : public ::testing::Test {
+class BinArchiveTest : public ::testing::Test {
 protected:
     void SetUp() override {
         Logging::init("test.log", spdlog::level::off, spdlog::level::debug);
@@ -34,32 +34,32 @@ protected:
         test_bin_path_ = test_dir_ / "test.bin";
         std::ofstream ofs(test_bin_path_, std::ios::binary);
         
-        // 写入 LINK 头部
-        uint32_t magic = 0x4B4E494C;  // "LINK"
+        // 写入 LINK 头部 (44 bytes)
+        uint32_t magic = 0x4B4E494C;  // "LINK" little-endian
         uint32_t version = 1;
+        uint32_t file_count = 2;
+        uint32_t index_offset = 44;   // 头部后
+        uint32_t index_size = 2 * 24; // 2 个索引条目
+        uint32_t data_offset = 44 + 48; // 头部 + 索引表
         uint32_t flags = 0;
-        uint32_t reserved = 0;
-        uint32_t index_offset = 32;  // 头部后
-        uint32_t index_count = 2;
-        uint32_t data_offset = 32 + 2 * 24;  // 头部 + 2个索引
-        uint32_t data_size = 100;
+        uint32_t reserved[4] = {0};
         
         ofs.write(reinterpret_cast<char*>(&magic), 4);
         ofs.write(reinterpret_cast<char*>(&version), 4);
-        ofs.write(reinterpret_cast<char*>(&flags), 4);
-        ofs.write(reinterpret_cast<char*>(&reserved), 4);
+        ofs.write(reinterpret_cast<char*>(&file_count), 4);
         ofs.write(reinterpret_cast<char*>(&index_offset), 4);
-        ofs.write(reinterpret_cast<char*>(&index_count), 4);
+        ofs.write(reinterpret_cast<char*>(&index_size), 4);
         ofs.write(reinterpret_cast<char*>(&data_offset), 4);
-        ofs.write(reinterpret_cast<char*>(&data_size), 4);
+        ofs.write(reinterpret_cast<char*>(&flags), 4);
+        ofs.write(reinterpret_cast<char*>(reserved), 16);
         
-        // 写入索引表 (2个条目)
+        // 写入索引表 (2 个条目，每个 24 字节)
         // 条目1: name_hash=0x12345678, offset=0, size=50, flags=0, type=1(Texture)
-        uint32_t entry1[] = {0x12345678, 0, 50, 0, 1, 0, 0};
+        uint32_t entry1[] = {0x12345678, 0, 50, 0, 1, 0};
         ofs.write(reinterpret_cast<char*>(entry1), 24);
         
         // 条目2: name_hash=0x87654321, offset=50, size=50, flags=0, type=3(Shader)
-        uint32_t entry2[] = {0x87654321, 50, 50, 0, 3, 0, 0};
+        uint32_t entry2[] = {0x87654321, 50, 50, 0, 3, 0};
         ofs.write(reinterpret_cast<char*>(entry2), 24);
         
         // 写入数据区 (100 字节)
@@ -73,95 +73,141 @@ protected:
     std::filesystem::path test_bin_path_;
 };
 
-TEST_F(BinParserTest, ParseValidBin) {
-    BinParser parser;
-    ASSERT_TRUE(parser.parse(test_bin_path_));
+TEST_F(BinArchiveTest, ParseValidBin) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << "Parse failed: " << tensyoki::to_string(result.error());
     
-    auto resources = parser.get_all_resources();
-    ASSERT_EQ(resources.size(), 2);
+    const auto& entries = archive.entries();
+    ASSERT_EQ(entries.size(), 2);
     
-    EXPECT_EQ(resources[0].name_hash, 0x12345678);
-    EXPECT_EQ(resources[0].offset, 32 + 48 + 0);  // data_offset + 0
-    EXPECT_EQ(resources[0].size, 50);
-    EXPECT_EQ(resources[0].type, BinParser::ResourceType::Texture);
+    EXPECT_EQ(entries[0].name_hash, 0x12345678);
+    EXPECT_EQ(entries[0].offset, 0);
+    EXPECT_EQ(entries[0].size, 50);
+    EXPECT_EQ(entries[0].type, 1);
     
-    EXPECT_EQ(resources[1].name_hash, 0x87654321);
-    EXPECT_EQ(resources[1].offset, 32 + 48 + 50);
-    EXPECT_EQ(resources[1].size, 50);
-    EXPECT_EQ(resources[1].type, BinParser::ResourceType::Shader);
+    EXPECT_EQ(entries[1].name_hash, 0x87654321);
+    EXPECT_EQ(entries[1].offset, 50);
+    EXPECT_EQ(entries[1].size, 50);
+    EXPECT_EQ(entries[1].type, 3);
 }
 
-TEST_F(BinParserTest, ExtractResource) {
-    BinParser parser;
-    ASSERT_TRUE(parser.parse(test_bin_path_));
+TEST_F(BinArchiveTest, ExtractResource) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << tensyoki::to_string(result.error());
     
-    auto resources = parser.get_all_resources();
-    ASSERT_EQ(resources.size(), 2);
+    const auto& entries = archive.entries();
+    ASSERT_EQ(entries.size(), 2);
     
-    std::vector<uint8_t> data;
-    ASSERT_TRUE(parser.extract_resource(resources[0], data));
-    ASSERT_EQ(data.size(), 50);
-    for (uint8_t b : data) EXPECT_EQ(b, 'T');
+    auto data_result = archive.extract(entries[0]);
+    ASSERT_TRUE(data_result);
+    ASSERT_EQ(data_result->size(), 50);
+    for (uint8_t b : *data_result) EXPECT_EQ(b, 'T');
     
-    ASSERT_TRUE(parser.extract_resource(resources[1], data));
-    ASSERT_EQ(data.size(), 50);
-    for (uint8_t b : data) EXPECT_EQ(b, 'S');
+    data_result = archive.extract(entries[1]);
+    ASSERT_TRUE(data_result);
+    ASSERT_EQ(data_result->size(), 50);
+    for (uint8_t b : *data_result) EXPECT_EQ(b, 'S');
 }
 
-TEST_F(BinParserTest, ExtractAll) {
-    BinParser parser;
-    ASSERT_TRUE(parser.parse(test_bin_path_));
+TEST_F(BinArchiveTest, ViewResource) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << tensyoki::to_string(result.error());
+    
+    const auto& entries = archive.entries();
+    ASSERT_EQ(entries.size(), 2);
+    
+    auto view_result = archive.view(entries[0]);
+    ASSERT_TRUE(view_result);
+    ASSERT_EQ(view_result->size(), 50);
+    for (uint8_t b : *view_result) EXPECT_EQ(b, 'T');
+}
+
+TEST_F(BinArchiveTest, ExtractAll) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << tensyoki::to_string(result.error());
     
     auto out_dir = test_dir_ / "extracted";
-    ASSERT_TRUE(parser.extract_all(out_dir));
+    auto extract_result = archive.extract_all(out_dir);
+    ASSERT_TRUE(extract_result);
     
-    ASSERT_TRUE(std::filesystem::exists(out_dir / "resource_12345678"));
-    ASSERT_TRUE(std::filesystem::exists(out_dir / "resource_87654321"));
+    ASSERT_TRUE(std::filesystem::exists(out_dir / "file_0000_12345678"));
+    ASSERT_TRUE(std::filesystem::exists(out_dir / "file_0001_87654321"));
 }
 
-TEST_F(BinParserTest, FindResource) {
-    BinParser parser;
-    ASSERT_TRUE(parser.parse(test_bin_path_));
+TEST_F(BinArchiveTest, FindEntry) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << tensyoki::to_string(result.error());
     
     // 默认名称是哈希值
-    const auto* res = parser.find_resource("resource_12345678");
-    ASSERT_NE(res, nullptr);
-    EXPECT_EQ(res->name_hash, 0x12345678);
+    const auto* entry = archive.find_entry("file_0000_12345678");
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->name_hash, 0x12345678);
     
     // 不存在的资源
-    EXPECT_EQ(parser.find_resource("nonexistent"), nullptr);
+    EXPECT_EQ(archive.find_entry("nonexistent"), nullptr);
 }
 
-TEST_F(BinParserTest, FilterByType) {
-    BinParser parser;
-    ASSERT_TRUE(parser.parse(test_bin_path_));
+TEST_F(BinArchiveTest, FindByHash) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << tensyoki::to_string(result.error());
     
-    auto textures = parser.get_resources_by_type(BinParser::ResourceType::Texture);
-    ASSERT_EQ(textures.size(), 1);
-    EXPECT_EQ(textures[0].name_hash, 0x12345678);
+    const auto* entry = archive.find_entry_by_hash(0x12345678);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->name_hash, 0x12345678);
     
-    auto shaders = parser.get_resources_by_type(BinParser::ResourceType::Shader);
-    ASSERT_EQ(shaders.size(), 1);
-    EXPECT_EQ(shaders[0].name_hash, 0x87654321);
+    EXPECT_EQ(archive.find_entry_by_hash(0xDEADBEEF), nullptr);
 }
 
-TEST_F(BinParserTest, InvalidMagic) {
+TEST_F(BinArchiveTest, InvalidMagic) {
     // 创建无效魔数文件
     auto bad_path = test_dir_ / "bad.bin";
     std::ofstream ofs(bad_path, std::ios::binary);
     uint32_t bad_magic = 0xDEADBEEF;
     ofs.write(reinterpret_cast<char*>(&bad_magic), 4);
     
-    BinParser parser;
-    EXPECT_FALSE(parser.parse(bad_path));
+    BinArchive archive;
+    auto result = archive.load_from_file(bad_path);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), BinParseError::InvalidMagic);
 }
 
-TEST_F(BinParserTest, EmptyFile) {
+TEST_F(BinArchiveTest, EmptyFile) {
     auto empty_path = test_dir_ / "empty.bin";
     std::ofstream ofs(empty_path, std::ios::binary);
     
-    BinParser parser;
-    EXPECT_FALSE(parser.parse(empty_path));
+    BinArchive archive;
+    auto result = archive.load_from_file(empty_path);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), BinParseError::FileTooSmall);
+}
+
+TEST_F(BinArchiveTest, LoadFromMemory) {
+    BinArchive archive;
+    auto result = archive.load_from_file(test_bin_path_);
+    ASSERT_TRUE(result) << tensyoki::to_string(result.error());
+    
+    // 使用 load_from_memory 重新解析
+    BinArchive archive2;
+    auto view_result = archive.view(archive.entries()[0]);
+    ASSERT_TRUE(view_result);
+    
+    // 读取整个文件到内存
+    std::ifstream file(test_bin_path_, std::ios::binary);
+    file.seekg(0, std::ios::end);
+    size_t size = file.tellg();
+    file.seekg(0);
+    std::vector<uint8_t> file_data(size);
+    file.read(reinterpret_cast<char*>(file_data.data()), size);
+    
+    auto result2 = archive2.load_from_memory(file_data);
+    ASSERT_TRUE(result2) << tensyoki::to_string(result2.error());
+    ASSERT_EQ(archive2.entries().size(), 2);
 }
 
 } // namespace test

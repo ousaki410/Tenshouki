@@ -248,6 +248,8 @@ public:
     static constexpr uint32_t SUPPORTED_VERSION_MAX = 3;
     
     // 内部解析方法
+    BinResult<void> parse_owned(std::vector<uint8_t>&& data);     // 接管所有权解析
+    BinResult<void> parse_from_span(std::span<const uint8_t> data); // 从 span 解析
     BinResult<void> parse_header(std::span<const uint8_t> data);
     BinResult<void> parse_index_table(std::span<const uint8_t> data);
     BinResult<void> validate_data_blocks() const;

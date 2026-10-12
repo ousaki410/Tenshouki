@@ -59,7 +59,7 @@ struct OfficerRecord {
     uint8_t  charm;           // 魅力
     char     name[20];        // 姓名 (固定长度，可能含 Shift-JIS 编码)
     char     kana[20];        // 假名/字号
-    uint8_t  reserved[6];     // 保留字段以凑齐 64 字节
+    uint8_t  reserved[12];    // 保留字段以凑齐 64 字节
 };
 #pragma pack(pop)
 

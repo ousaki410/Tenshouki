@@ -93,9 +93,10 @@ constexpr std::string_view to_string(GrpParseError err) noexcept {
     return "Unknown GRP error";
 }
 
-/// 结果类型
+/// 结果类型 (使用 bin_parser 的 Result 类型)
+#include "bin_parser.hpp"
 template<typename T>
-using GrpResult = std::expected<T, GrpParseError>;
+using GrpResult = Result<T, GrpParseError>;
 
 /// GRP 图像解析器
 class GrpParser {

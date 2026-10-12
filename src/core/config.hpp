@@ -4,13 +4,14 @@
 
 #pragma once
 
-#include <toml.hpp>
+#include <toml++/toml.hpp>
 #include <string>
 #include <filesystem>
 #include <optional>
 #include <variant>
 #include <unordered_map>
 #include <mutex>
+#include <shared_mutex>
 
 namespace tensyoki {
 
@@ -47,11 +48,35 @@ public:
         return default_value;
     }
     
+    // 重载：处理字符串字面量
+    std::string get(const std::string& key, const char* default_value) const {
+        return get(key, std::string(default_value));
+    }
+    
+    // 重载：处理字符串字面量（非 const）
+    std::string get(const std::string& key, std::string_view default_value) const {
+        return get(key, std::string(default_value));
+    }
+    
     // 设置值
     template<typename T>
     void set(const std::string& key, const T& value) {
         std::unique_lock lock(mutex_);
         values_[key] = value;
+        dirty_ = true;
+    }
+    
+    // 重载：处理字符串字面量
+    void set(const std::string& key, const char* value) {
+        std::unique_lock lock(mutex_);
+        values_[key] = std::string(value);
+        dirty_ = true;
+    }
+    
+    // 重载：处理 string_view
+    void set(const std::string& key, std::string_view value) {
+        std::unique_lock lock(mutex_);
+        values_[key] = std::string(value);
         dirty_ = true;
     }
     
@@ -158,6 +183,9 @@ private:
     
     // 保存到 TOML 表
     void save_table(toml::table& tbl) const;
+    
+    // 设置默认值
+    void set_defaults();
 };
 
 } // namespace tensyoki

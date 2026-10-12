@@ -20,7 +20,7 @@ public:
     bool init(const WindowParams& params) override {
         // 初始化 SDL
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_EVENTS)) {
-            log_error("SDL_Init failed: {}", SDL_GetError());
+            LOG_ERROR("SDL_Init failed: {}", SDL_GetError());
             return false;
         }
         
@@ -54,14 +54,14 @@ public:
         );
         
         if (!window_) {
-            log_error("SDL_CreateWindow failed: {}", SDL_GetError());
+            LOG_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
             return false;
         }
         
         // 创建 OpenGL 上下文
         gl_context_ = SDL_GL_CreateContext(window_);
         if (!gl_context_) {
-            log_error("SDL_GL_CreateContext failed: {}", SDL_GetError());
+            LOG_ERROR("SDL_GL_CreateContext failed: {}", SDL_GetError());
             return false;
         }
         
@@ -79,7 +79,7 @@ public:
         // 设置 DPI 感知
         SDL_SetAppMetadata("Tensyoki Linux Port", "0.1.0", "org.tensyoki.port");
         
-        log_info("Linux platform initialized: {}x{}", params.width, params.height);
+        LOG_INFO("Linux platform initialized: {}x{}", params.width, params.height);
         return true;
     }
     
@@ -123,8 +123,16 @@ public:
     
     void set_fullscreen(bool fullscreen) override {
         if (window_) {
-            SDL_SetWindowFullscreenMode(window_, fullscreen ? 
-                SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(window_), nullptr)[0] : nullptr);
+            if (fullscreen) {
+                int mode_count = 0;
+                SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(window_), &mode_count);
+                if (modes && mode_count > 0) {
+                    SDL_SetWindowFullscreenMode(window_, modes[0]);
+                }
+                if (modes) SDL_free(modes);
+            } else {
+                SDL_SetWindowFullscreenMode(window_, nullptr);
+            }
         }
     }
     
@@ -151,7 +159,7 @@ public:
             SDL_SetWindowIcon(window_, icon);
             SDL_DestroySurface(icon);
         } else {
-            log_warn("Failed to load window icon: {}", icon_path.string());
+            LOG_WARN("Failed to load window icon: {}", icon_path.string());
         }
     }
     
@@ -195,7 +203,7 @@ public:
         DisplayMode mode = {0, 0, 0, true};
         if (window_) {
             SDL_DisplayID display = SDL_GetDisplayForWindow(window_);
-            SDL_DisplayMode* sdl_mode = SDL_GetCurrentDisplayMode(display);
+            const SDL_DisplayMode* sdl_mode = SDL_GetCurrentDisplayMode(display);
             if (sdl_mode) {
                 mode.width = sdl_mode->w;
                 mode.height = sdl_mode->h;
@@ -221,8 +229,9 @@ public:
         const std::filesystem::path& default_path,
         const std::vector<std::pair<std::string, std::string>>& filters
     ) override {
+        (void)title; (void)default_path; (void)filters;
         // TODO: 使用 zenity/kdialog 或 SDL3 的原生对话框 (如果可用)
-        log_warn("File dialog not implemented on Linux");
+        LOG_WARN("File dialog not implemented on Linux");
         return std::nullopt;
     }
     
@@ -231,7 +240,8 @@ public:
         const std::filesystem::path& default_path,
         const std::vector<std::pair<std::string, std::string>>& filters
     ) override {
-        log_warn("Save file dialog not implemented on Linux");
+        (void)title; (void)default_path; (void)filters;
+        LOG_WARN("Save file dialog not implemented on Linux");
         return std::nullopt;
     }
     
@@ -239,14 +249,15 @@ public:
         const std::string& title,
         const std::filesystem::path& default_path
     ) override {
-        log_warn("Folder dialog not implemented on Linux");
+        (void)title; (void)default_path;
+        LOG_WARN("Folder dialog not implemented on Linux");
         return std::nullopt;
     }
     
     bool is_key_pressed(int keycode) const override {
         const bool* state = SDL_GetKeyboardState(nullptr);
         SDL_Scancode scancode = static_cast<SDL_Scancode>(keycode);
-        return scancode < SDL_NUM_SCANCODES && state[scancode];
+        return scancode < SDL_SCANCODE_COUNT && state[scancode];
     }
     
     bool is_mouse_button_pressed(int button) const override {
@@ -276,7 +287,11 @@ public:
     }
     
     void set_cursor_visible(bool visible) override {
-        SDL_ShowCursor(visible);
+        if (visible) {
+            SDL_ShowCursor();
+        } else {
+            SDL_HideCursor();
+        }
     }
     
     void set_cursor_shape(int shape) override {
@@ -290,7 +305,14 @@ public:
             SDL_SYSTEM_CURSOR_NOT_ALLOWED
         };
         if (shape >= 0 && shape < static_cast<int>(std::size(cursors))) {
-            SDL_SetCursor(SDL_CreateSystemCursor(cursors[shape]));
+            // Cache cursors to avoid leaks
+            static SDL_Cursor* cached_cursors[7] = {nullptr};
+            if (!cached_cursors[shape]) {
+                cached_cursors[shape] = SDL_CreateSystemCursor(cursors[shape]);
+            }
+            if (cached_cursors[shape]) {
+                SDL_SetCursor(cached_cursors[shape]);
+            }
         }
     }
     
@@ -302,7 +324,11 @@ public:
     }
     
     std::string get_joystick_name(int index) const override {
-        SDL_Joystick* joy = SDL_OpenJoystick(index);
+        int count = 0;
+        SDL_JoystickID* joysticks = SDL_GetJoysticks(&count);
+        if (index < 0 || index >= count) return "";
+        SDL_Joystick* joy = SDL_OpenJoystick(joysticks[index]);
+        if (joysticks) SDL_free(joysticks);
         if (!joy) return "";
         const char* name = SDL_GetJoystickName(joy);
         std::string result = name ? name : "";
@@ -311,7 +337,14 @@ public:
     }
     
     bool is_joystick_button_pressed(int joystick, int button) const override {
-        SDL_Joystick* joy = SDL_OpenJoystick(joystick);
+        int count = 0;
+        SDL_JoystickID* joysticks = SDL_GetJoysticks(&count);
+        if (joystick < 0 || joystick >= count) {
+            if (joysticks) SDL_free(joysticks);
+            return false;
+        }
+        SDL_Joystick* joy = SDL_OpenJoystick(joysticks[joystick]);
+        if (joysticks) SDL_free(joysticks);
         if (!joy) return false;
         bool pressed = SDL_GetJoystickButton(joy, button);
         SDL_CloseJoystick(joy);
@@ -319,7 +352,14 @@ public:
     }
     
     float get_joystick_axis(int joystick, int axis) const override {
-        SDL_Joystick* joy = SDL_OpenJoystick(joystick);
+        int count = 0;
+        SDL_JoystickID* joysticks = SDL_GetJoysticks(&count);
+        if (joystick < 0 || joystick >= count) {
+            if (joysticks) SDL_free(joysticks);
+            return 0.0f;
+        }
+        SDL_Joystick* joy = SDL_OpenJoystick(joysticks[joystick]);
+        if (joysticks) SDL_free(joysticks);
         if (!joy) return 0.0f;
         Sint16 value = SDL_GetJoystickAxis(joy, axis);
         SDL_CloseJoystick(joy);
@@ -327,7 +367,11 @@ public:
     }
     
     bool is_joystick_connected(int index) const override {
-        return SDL_JoystickGetDeviceInstanceID(index) != 0;
+        int count = 0;
+        SDL_JoystickID* joysticks = SDL_GetJoysticks(&count);
+        bool result = (index >= 0 && index < count);
+        if (joysticks) SDL_free(joysticks);
+        return result;
     }
     
     void request_quit() override { should_quit_ = true; }
@@ -347,8 +391,8 @@ public:
     
     void* get_display_handle() const override {
         // Wayland: wl_display*, X11: Display*
-        return SDL_GetWindowWMInfo(window_, nullptr) ? 
-            SDL_GetWindowWMInfo(window_, nullptr)->info.x11.display : nullptr;
+        // SDL3 doesn't provide direct WM info access, return nullptr for now
+        return nullptr;
     }
     
     void swap_buffers() override {
@@ -357,14 +401,12 @@ public:
     
     float get_dpi_scale() const override {
         if (window_) {
-            float scale = 1.0f;
-            SDL_GetWindowDisplayScale(window_, &scale);
-            return scale;
+            return SDL_GetWindowDisplayScale(window_);
         }
         return 1.0f;
     }
     
-    void set_dpi_aware(bool aware) override {
+    void set_dpi_aware(bool /*aware*/) override {
         // SDL3 自动处理
     }
     
@@ -431,7 +473,7 @@ private:
             case SDL_EVENT_DROP_FILE:
                 if (drop_cb_) {
                     std::vector<std::filesystem::path> paths;
-                    paths.emplace_back(event.drop.file);
+                    paths.emplace_back(event.drop.data);
                     drop_cb_(paths);
                 }
                 break;

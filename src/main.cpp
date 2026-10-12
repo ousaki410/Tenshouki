@@ -5,11 +5,11 @@
 #include "core/config.hpp"
 #include "core/filesystem.hpp"
 #include "core/logging.hpp"
-#include "core/math/math_utils.hpp"
+#include "core/math_utils.hpp"
 #include "render/renderer.hpp"
 #include "resource/bin_parser.hpp"
 #include "ui/imgui_backend.hpp"
-#include "platform/linux/platform_linux.hpp"
+#include "platform/platform.hpp"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -19,6 +19,7 @@
 #include <iostream>
 #include <memory>
 #include <filesystem>
+#include <chrono>
 
 namespace tensyoki {
 
@@ -49,16 +50,16 @@ private:
     bool init() {
         // 初始化日志
         Logging::init("tensyoki.log");
-        log_info("=== Tensyoki Linux Port ===");
-        log_info("Version: 0.1.0-dev");
-        log_info("Build: {}", __DATE__ " " __TIME__);
+        LOG_INFO("=== Tensyoki Linux Port ===");
+        LOG_INFO("Version: 0.1.0-dev");
+        LOG_INFO("Build: {} {}", __DATE__, __TIME__);
         
         // 解析命令行参数获取数据路径
         parse_args();
         
         // 初始化 VFS
         if (!VFS::instance().mount(data_root_, "/")) {
-            log_error("Failed to mount data root: {}", data_root_.string());
+            LOG_ERROR("Failed to mount data root: {}", data_root_.string());
             return false;
         }
         
@@ -67,50 +68,80 @@ private:
         
         // 初始化平台抽象
         platform_ = Platform::create();
-        if (!platform_->init(Config::instance().get_window_width(), 
-                            Config::instance().get_window_height(),
-                            Config::instance().get_window_title())) {
-            log_error("Platform initialization failed");
+        Platform::WindowParams window_params;
+        window_params.title = Config::instance().get_window_title();
+        window_params.width = Config::instance().get_window_width();
+        window_params.height = Config::instance().get_window_height();
+        window_params.fullscreen = Config::instance().get_fullscreen();
+        window_params.vsync = Config::instance().get_vsync();
+        
+        if (!platform_->init(window_params)) {
+            LOG_ERROR("Platform initialization failed");
             return false;
         }
         
         // 初始化渲染器
         renderer_ = std::make_unique<Renderer>();
-        if (!renderer_->init(platform_->get_window_handle())) {
-            log_error("Renderer initialization failed");
+        Renderer::InitParams render_params;
+        render_params.backend = Renderer::Backend::OpenGL;
+        render_params.window_handle = platform_->get_window_handle();
+        render_params.width = window_params.width;
+        render_params.height = window_params.height;
+        render_params.vsync = window_params.vsync;
+        render_params.debug_overlay = Config::instance().get_debug_overlay();
+        
+        if (!renderer_->init(render_params)) {
+            LOG_ERROR("Renderer initialization failed");
             return false;
         }
         
         // 初始化 ImGui
         imgui_ = std::make_unique<ImGuiBackend>();
-        if (!imgui_->init(platform_->get_window_handle(), renderer_->get_device())) {
-            log_error("ImGui initialization failed");
+        ImGuiBackend::InitParams imgui_params;
+        imgui_params.window_handle = platform_->get_window_handle();
+        imgui_params.device = renderer_->get_device();
+        imgui_params.enable_docking = true;
+        imgui_params.enable_viewports = true;
+        imgui_params.ini_filename = (VFS::instance().get_user_data_dir() / "imgui.ini").string();
+        
+        if (!imgui_->init(imgui_params)) {
+            LOG_ERROR("ImGui initialization failed");
             return false;
         }
+        
+        // 设置中文字体
+        imgui_->load_font_default(18.0f);
+        imgui_->set_style_dark();
         
         // 测试资源解析
         test_resource_parsing();
         
-        log_info("Initialization complete");
+        LOG_INFO("Initialization complete");
         return true;
     }
     
     void parse_args() {
         // 优先级: 命令行 > 环境变量 > 配置文件 > 自动检测
-        data_root_ = Config::instance().get_data_root();
-        
         if (argc_ > 1) {
             data_root_ = argv_[1];
         } else if (const char* env = std::getenv("TENSYOKI_DATA_ROOT")) {
             data_root_ = env;
         } else {
+            data_root_ = Config::instance().get_data_root();
+        }
+        
+        if (data_root_.empty()) {
             // 自动检测常见路径
             std::vector<std::filesystem::path> candidates = {
                 std::filesystem::current_path() / "data",
                 std::filesystem::current_path() / "NOBUNAGA'S AMBITION Tenshouki with Power Up Kit HD version",
                 "/usr/share/tensyoki/data",
-                std::filesystem::path(std::getenv("HOME")) / ".local/share/tensyoki/data",
             };
+            
+            // Only add HOME if it's set
+            if (const char* home = std::getenv("HOME")) {
+                candidates.push_back(std::filesystem::path(home) / ".local/share/tensyoki/data");
+            }
             
             for (const auto& p : candidates) {
                 if (std::filesystem::exists(p / "res" / "res_grp.bin")) {
@@ -121,48 +152,53 @@ private:
         }
         
         if (data_root_.empty() || !std::filesystem::exists(data_root_)) {
-            log_error("Game data not found. Please specify data root path.");
-            log_error("Usage: tensyoki [data_root_path]");
-            log_error("Or set TENSYOKI_DATA_ROOT environment variable");
+            LOG_ERROR("Game data not found. Please specify data root path.");
+            LOG_ERROR("Usage: tensyoki [data_root_path]");
+            LOG_ERROR("Or set TENSYOKI_DATA_ROOT environment variable");
             data_root_ = ".";  // 允许继续运行以显示错误 UI
         } else {
-            log_info("Data root: {}", data_root_.string());
+            LOG_INFO("Data root: {}", data_root_.string());
         }
     }
     
     void test_resource_parsing() {
-        log_info("Testing resource parsing...");
+        LOG_INFO("Testing resource parsing...");
         
         // 测试解析 shader.bin
-        BinParser shader_parser;
-        if (shader_parser.parse("res/res_shader.bin")) {
-            log_info("res_shader.bin: {} resources", shader_parser.get_all_resources().size());
-            shader_parser.dump_info(log_info_stream());
+        BinArchive shader_archive;
+        auto shader_result = shader_archive.load_from_file(data_root_ / "res" / "res_shader.bin");
+        if (shader_result) {
+            LOG_INFO("res_shader.bin: {} resources", shader_archive.entries().size());
+            auto info = shader_archive.info();
+            LOG_INFO("  Version: {}, Files: {}, Total: {} bytes", info.version, info.file_count, info.total_size);
+        } else {
+            LOG_WARN("Failed to parse res_shader.bin: {}", tensyoki::to_string(shader_result.error()));
         }
         
         // 测试解析 else.bin
-        BinParser else_parser;
-        if (else_parser.parse("res/res_else.bin")) {
-            log_info("res_else.bin: {} resources", else_parser.get_all_resources().size());
+        BinArchive else_archive;
+        auto else_result = else_archive.load_from_file(data_root_ / "res" / "res_else.bin");
+        if (else_result) {
+            LOG_INFO("res_else.bin: {} resources", else_archive.entries().size());
+        } else {
+            LOG_WARN("Failed to parse res_else.bin: {}", tensyoki::to_string(else_result.error()));
         }
         
         // 测试解析 grp.bin (大文件，可能只解析索引)
-        BinParser grp_parser;
-        if (grp_parser.parse("res/res_grp.bin")) {
-            log_info("res_grp.bin: {} resources", grp_parser.get_all_resources().size());
-        }
-
-        // 缓存 grp 解析器供 UI 使用（延迟加载避免启动卡顿）
-        grp_parser_ = std::make_unique<BinParser>();
-        if (grp_parser_->parse("res/res_grp.bin")) {
-            log_info("Cached res_grp.bin: {} resources", grp_parser_->get_all_resources().size());
+        BinArchive grp_archive;
+        auto grp_result = grp_archive.load_from_file(data_root_ / "res" / "res_grp.bin");
+        if (grp_result) {
+            LOG_INFO("res_grp.bin: {} resources", grp_archive.entries().size());
+        } else {
+            LOG_WARN("Failed to parse res_grp.bin: {}", tensyoki::to_string(grp_result.error()));
         }
     }
     
     void main_loop() {
         bool running = true;
         uint64_t frame_count = 0;
-        auto last_time = std::chrono::high_resolution_clock::now();
+        auto last_fps_time = std::chrono::high_resolution_clock::now();
+        uint64_t frames_since_fps = 0;
         
         while (running) {
             // 处理事件
@@ -180,17 +216,21 @@ private:
                     }
                 } else if (event.type == SDL_EVENT_WINDOW_RESIZED) {
                     renderer_->on_resize(event.window.data1, event.window.data2);
+                    imgui_->on_resize(event.window.data1, event.window.data2);
                 }
             }
             
-            // 计算帧时间
-            auto current_time = std::chrono::high_resolution_clock::now();
-            float delta_time = std::chrono::duration<float>(current_time - last_time).count();
-            last_time = current_time;
+            // Check platform quit request
+            if (platform_->should_quit()) {
+                running = false;
+            }
             
             // 开始新帧
-            imgui_->new_frame(delta_time);
+            imgui_->new_frame(1.0f / 60.0f); // Fixed timestep for UI
             renderer_->begin_frame();
+            
+            // 清屏
+            renderer_->clear(0.1f, 0.1f, 0.15f, 1.0f);
             
             // 渲染 UI
             render_ui();
@@ -201,14 +241,15 @@ private:
             platform_->swap_buffers();
             
             frame_count++;
+            frames_since_fps++;
             
             // FPS 统计
-            if (frame_count % 60 == 0) {
-                auto now = std::chrono::high_resolution_clock::now();
-                float elapsed = std::chrono::duration<float>(now - last_time).count();
-                if (elapsed > 0) {
-                    log_debug("FPS: {:.1f}", 60.0f / elapsed);
-                }
+            auto now = std::chrono::high_resolution_clock::now();
+            float elapsed = std::chrono::duration<float>(now - last_fps_time).count();
+            if (elapsed >= 1.0f) {
+                LOG_DEBUG("FPS: {:.1f}", frames_since_fps / elapsed);
+                frames_since_fps = 0;
+                last_fps_time = now;
             }
         }
     }
@@ -257,18 +298,18 @@ private:
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Extract Selected")) {
-                    if (selected_entry_ && selected_parser_) {
-                        auto result = selected_parser_->extract(*selected_entry_);
+                    if (selected_entry_ && selected_archive_) {
+                        auto result = selected_archive_->extract(*selected_entry_);
                         if (result) {
-                            log_info("Extracted '{}' ({} bytes)", selected_entry_->name, result->size());
+                            LOG_INFO("Extracted '{}' ({} bytes)", selected_entry_->name, result->size());
                         } else {
-                            log_error("Extract failed: {}", tensyoki::to_string(result.error()));
+                            LOG_ERROR("Extract failed: {}", tensyoki::to_string(result.error()));
                         }
                     }
                 }
                 if (ImGui::MenuItem("Extract All")) {
-                    if (selected_parser_) {
-                        selected_parser_->extract_all("extracted/");
+                    if (selected_archive_) {
+                        selected_archive_->extract_all("extracted/");
                     }
                 }
                 ImGui::EndMenu();
@@ -297,12 +338,17 @@ private:
                 bool selected = (current_file == f);
                 if (ImGui::Selectable(f, selected)) {
                     current_file = f;
-                    if (!grp_parser_ || current_file == "res/res_grp.bin") {
-                        if (!grp_parser_) grp_parser_ = std::make_unique<BinParser>();
-                        if (grp_parser_->parse(current_file)) {
-                            log_info("Parsed {}: {} resources", current_file, grp_parser_->get_all_resources().size());
-                        }
-                        selected_parser_ = grp_parser_.get();
+                    // Load the selected archive
+                    BinArchive* new_archive = new BinArchive();
+                    auto result = new_archive->load_from_file(data_root_ / f);
+                    if (result) {
+                        LOG_INFO("Parsed {}: {} resources", f, new_archive->entries().size());
+                        // Clean up old archive if needed
+                        delete selected_archive_;
+                        selected_archive_ = new_archive;
+                    } else {
+                        LOG_WARN("Failed to parse {}: {}", f, tensyoki::to_string(result.error()));
+                        delete new_archive;
                     }
                     selected_entry_ = nullptr;
                 }
@@ -312,8 +358,8 @@ private:
         
         ImGui::Separator();
         
-        if (selected_parser_) {
-            ImGui::Text("Entries: %zu", selected_parser_->entries().size());
+        if (selected_archive_) {
+            ImGui::Text("Entries: %zu", selected_archive_->entries().size());
             ImGui::SameLine();
             ImGui::Text("(%s)", current_file.c_str());
         }
@@ -323,8 +369,8 @@ private:
         filter.Draw("Filter##res_filter", -100.0f);
         
         // Tree view of entries
-        if (selected_parser_) {
-            for (const auto& entry : selected_parser_->entries()) {
+        if (selected_archive_) {
+            for (const auto& entry : selected_archive_->entries()) {
                 if (!filter.PassFilter(entry.name.c_str())) continue;
                 
                 ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_SpanAvailWidth;
@@ -333,7 +379,7 @@ private:
                 bool opened = ImGui::TreeNodeEx(entry.name.c_str(), flags);
                 if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
                     selected_entry_ = &entry;
-                    selected_parser_ = selected_parser_;
+                    selected_archive_ = selected_archive_;
                 }
                 if (opened) ImGui::TreePop();
             }
@@ -345,8 +391,8 @@ private:
         // Right pane: Details / Hex Dump
         ImGui::BeginChild("RightPane", ImVec2(0, 0), true);
         
-        if (selected_entry_ && selected_parser_) {
-            render_entry_details(*selected_entry_, *selected_parser_);
+        if (selected_entry_ && selected_archive_) {
+            render_entry_details(*selected_entry_, *selected_archive_);
         } else {
             ImGui::Text("Select a resource from the list");
             ImGui::TextDisabled("Use the filter to narrow down entries");
@@ -356,7 +402,7 @@ private:
         ImGui::End();
     }
     
-    void render_entry_details(const BinFileEntry& entry, const BinParser& parser) {
+    void render_entry_details(const BinFileEntry& entry, const BinArchive& archive) {
         ImGui::Text("Name: %s", entry.name.c_str());
         ImGui::Text("Hash: 0x%08X", entry.name_hash);
         ImGui::Text("Offset: 0x%08X (%u)", entry.offset, entry.offset);
@@ -369,11 +415,11 @@ private:
         
         // Action buttons
         if (ImGui::Button("Extract")) {
-            auto result = parser.extract(entry);
+            auto result = archive.extract(entry);
             if (result) {
-                log_info("Extracted '{}' ({} bytes)", entry.name, result->size());
+                LOG_INFO("Extracted '{}' ({} bytes)", entry.name, result->size());
             } else {
-                log_error("Extract failed: {}", tensyoki::to_string(result.error()));
+                LOG_ERROR("Extract failed: {}", tensyoki::to_string(result.error()));
             }
         }
         ImGui::SameLine();
@@ -389,7 +435,7 @@ private:
             ImGui::SameLine();
             ImGui::Checkbox("Show All", &show_full_hex_);
             
-            auto view_result = parser.view(entry);
+            auto view_result = archive.view(entry);
             if (view_result) {
                 const auto& data = *view_result;
                 size_t dump_size = show_full_hex_ ? data.size() : std::min<size_t>(256, data.size());
@@ -449,7 +495,7 @@ private:
     bool show_full_hex_ = false;
     
     void shutdown() {
-        log_info("Shutting down...");
+        LOG_INFO("Shutting down...");
         
         imgui_.reset();
         renderer_.reset();
@@ -465,9 +511,8 @@ private:
     bool show_shader_viewer_ = false;
     bool show_dat_viewer_ = false;
 
-    std::unique_ptr<BinParser> grp_parser_;
+    BinArchive* selected_archive_ = nullptr;
     const BinFileEntry* selected_entry_ = nullptr;
-    const BinParser* selected_parser_ = nullptr;
 };
 
 } // namespace tensyoki

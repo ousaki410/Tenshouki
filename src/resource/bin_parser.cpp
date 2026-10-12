@@ -28,51 +28,24 @@ void BinArchive::write_u32_le(std::vector<uint8_t>& data, size_t offset, uint32_
     data[offset + 3] = static_cast<uint8_t>((value >> 24) & 0xFF);
 }
 
-BinResult<void> BinArchive::load_from_file(const std::filesystem::path& path) {
+// 解析辅助：不清理现有数据，用于 load_from_file 内部使用
+BinResult<void> BinArchive::parse_owned(std::vector<uint8_t>&& data) {
+    // 先清理
     clear();
     
-    LOG_INFO("Loading BIN archive: {}", path.string());
-    
-    // 检查文件存在
-    if (!std::filesystem::exists(path)) {
-        LOG_ERROR("File not found: {}", path.string());
-        return BinResult<void>::failure(BinParseError::FileNotFound);
-    }
-    
-    // 获取文件大小
-    auto file_size = std::filesystem::file_size(path);
-    if (file_size < sizeof(Header)) {
-        LOG_ERROR("File too small ({} bytes, min {}): {}", file_size, sizeof(Header), path.string());
-        return BinResult<void>::failure(BinParseError::FileTooSmall);
-    }
-    
-    // 读取文件到内存
-    file_data_.resize(file_size);
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        LOG_ERROR("Failed to open file: {}", path.string());
-        return BinResult<void>::failure(BinParseError::IOError);
-    }
-    
-    file.read(reinterpret_cast<char*>(file_data_.data()), file_size);
-    if (!file) {
-        LOG_ERROR("Failed to read file: {}", path.string());
-        return BinResult<void>::failure(BinParseError::IOError);
-    }
-    
-    source_path_ = path;
+    // 取得所有权
+    file_data_ = std::move(data);
     
     // 解析
-    auto result = load_from_memory(file_data_);
+    auto result = parse_from_span(file_data_);
     if (!result) {
         clear();
     }
     return result;
 }
 
-BinResult<void> BinArchive::load_from_memory(std::span<const uint8_t> data) {
-    clear();
-    
+// 解析辅助：从 span 解析，不接管所有权
+BinResult<void> BinArchive::parse_from_span(std::span<const uint8_t> data) {
     // 1. 解析头部
     auto header_result = parse_header(data);
     if (!header_result) return header_result;
@@ -89,6 +62,50 @@ BinResult<void> BinArchive::load_from_memory(std::span<const uint8_t> data) {
     loaded_ = true;
     LOG_INFO("Successfully loaded BIN archive: {} files, version {}", entries_.size(), header_.version);
     return BinResult<void>::success();
+}
+
+BinResult<void> BinArchive::load_from_file(const std::filesystem::path& path) {
+    LOG_INFO("Loading BIN archive: {}", path.string());
+    
+    // 检查文件存在
+    if (!std::filesystem::exists(path)) {
+        LOG_ERROR("File not found: {}", path.string());
+        return BinResult<void>::failure(BinParseError::FileNotFound);
+    }
+    
+    // 获取文件大小
+    auto file_size = std::filesystem::file_size(path);
+    if (file_size < sizeof(Header)) {
+        LOG_ERROR("File too small ({} bytes, min {}): {}", file_size, sizeof(Header), path.string());
+        return BinResult<void>::failure(BinParseError::FileTooSmall);
+    }
+    
+    // 读取文件到局部缓冲区
+    std::vector<uint8_t> file_data;
+    file_data.resize(file_size);
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        LOG_ERROR("Failed to open file: {}", path.string());
+        return BinResult<void>::failure(BinParseError::IOError);
+    }
+    
+    file.read(reinterpret_cast<char*>(file_data.data()), file_size);
+    if (!file) {
+        LOG_ERROR("Failed to read file: {}", path.string());
+        return BinResult<void>::failure(BinParseError::IOError);
+    }
+    
+    source_path_ = path;
+    
+    // 解析并接管所有权
+    return parse_owned(std::move(file_data));
+}
+
+BinResult<void> BinArchive::load_from_memory(std::span<const uint8_t> data) {
+    // 解析外部数据，但不接管所有权（复制到内部缓冲区以支持 view()）
+    clear();
+    file_data_.assign(data.begin(), data.end());
+    return parse_from_span(file_data_);
 }
 
 BinResult<void> BinArchive::parse_header(std::span<const uint8_t> data) {
@@ -133,13 +150,15 @@ BinResult<void> BinArchive::parse_header(std::span<const uint8_t> data) {
         return BinResult<void>::failure(BinParseError::CorruptedIndex);
     }
     
-    if (header_.index_offset + header_.index_size > data.size()) {
+    // 使用 64 位运算避免溢出
+    uint64_t index_end = static_cast<uint64_t>(header_.index_offset) + static_cast<uint64_t>(header_.index_size);
+    if (index_end > data.size()) {
         LOG_ERROR("Index table extends beyond file: off=0x{:X}+0x{:X} > size=0x{:X}",
                   header_.index_offset, header_.index_size, data.size());
         return BinResult<void>::failure(BinParseError::CorruptedIndex);
     }
     
-    if (header_.data_offset > data.size()) {
+    if (static_cast<uint64_t>(header_.data_offset) > data.size()) {
         LOG_ERROR("Data offset beyond file: 0x{:X} > 0x{:X}", header_.data_offset, data.size());
         return BinResult<void>::failure(BinParseError::CorruptedIndex);
     }
@@ -150,9 +169,11 @@ BinResult<void> BinArchive::parse_header(std::span<const uint8_t> data) {
 BinResult<void> BinArchive::parse_index_table(std::span<const uint8_t> data) {
     constexpr size_t ENTRY_SIZE = sizeof(IndexEntry);
     
-    if (data.size() < header_.file_count * ENTRY_SIZE) {
+    // 使用 64 位运算避免溢出
+    uint64_t required_size = static_cast<uint64_t>(header_.file_count) * ENTRY_SIZE;
+    if (data.size() < required_size) {
         LOG_ERROR("Index table too small: {} bytes for {} entries (need {})",
-                  data.size(), header_.file_count, header_.file_count * ENTRY_SIZE);
+                  data.size(), header_.file_count, required_size);
         return BinResult<void>::failure(BinParseError::CorruptedIndex);
     }
     

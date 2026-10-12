@@ -60,7 +60,7 @@ std::vector<GrpImageFormat> GrpParser::supported_formats() {
 
 GrpResult<ImageData> GrpParser::parse(std::span<const uint8_t> data) const {
     if (data.size() < sizeof(GrpFileHeader)) {
-        return std::unexpected(GrpParseError::InvalidHeader);
+        return GrpResult<ImageData>::failure(GrpParseError::InvalidHeader);
     }
     
     // 解析头部
@@ -75,7 +75,7 @@ GrpResult<ImageData> GrpParser::parse(std::span<const uint8_t> data) const {
     // 基本验证
     if (header->width == 0 || header->height == 0 || 
         header->width > 8192 || header->height > 8192) {
-        return std::unexpected(GrpParseError::InvalidDimensions);
+        return GrpResult<ImageData>::failure(GrpParseError::InvalidDimensions);
     }
     
     GrpImageFormat format = static_cast<GrpImageFormat>(header->format);
@@ -116,7 +116,7 @@ GrpResult<ImageData> GrpParser::parse_rgba8888(std::span<const uint8_t> data,
     if (data.size() < pixel_offset + expected_size) {
         LOG_ERROR("RGBA8888 data too small: need {}, have {}", 
                   pixel_offset + expected_size, data.size());
-        return std::unexpected(GrpParseError::BufferTooSmall);
+        return GrpResult<ImageData>::failure(GrpParseError::BufferTooSmall);
     }
     
     img.pixels.assign(data.begin() + pixel_offset, 
@@ -139,7 +139,7 @@ GrpResult<ImageData> GrpParser::parse_rgb565(std::span<const uint8_t> data,
     size_t pixel_offset = header.pixel_offset ? header.pixel_offset : sizeof(GrpFileHeader);
     
     if (data.size() < pixel_offset + expected_size) {
-        return std::unexpected(GrpParseError::BufferTooSmall);
+        return GrpResult<ImageData>::failure(GrpParseError::BufferTooSmall);
     }
     
     // RGB565 转 RGBA8888
@@ -174,14 +174,14 @@ GrpResult<ImageData> GrpParser::parse_indexed8(std::span<const uint8_t> data,
     
     // 解析调色板
     auto palette_result = parse_palette(data, header);
-    if (!palette_result) return std::unexpected(palette_result.error());
+    if (!palette_result) return GrpResult<ImageData>::failure(palette_result.error());
     img.palette = std::move(*palette_result);
     
     size_t pixel_offset = header.pixel_offset ? header.pixel_offset : sizeof(GrpFileHeader);
     size_t expected_size = header.width * header.height;
     
     if (data.size() < pixel_offset + expected_size) {
-        return std::unexpected(GrpParseError::BufferTooSmall);
+        return GrpResult<ImageData>::failure(GrpParseError::BufferTooSmall);
     }
     
     img.pixels.resize(header.width * header.height * 4);
@@ -202,14 +202,14 @@ GrpResult<ImageData> GrpParser::parse_indexed4(std::span<const uint8_t> data,
     
     // 解析调色板 (16 色)
     auto palette_result = parse_palette(data, header);
-    if (!palette_result) return std::unexpected(palette_result.error());
+    if (!palette_result) return GrpResult<ImageData>::failure(palette_result.error());
     img.palette = std::move(*palette_result);
     
     size_t pixel_offset = header.pixel_offset ? header.pixel_offset : sizeof(GrpFileHeader);
     size_t expected_size = (header.width * header.height + 1) / 2; // 4bpp = 2像素/字节
     
     if (data.size() < pixel_offset + expected_size) {
-        return std::unexpected(GrpParseError::BufferTooSmall);
+        return GrpResult<ImageData>::failure(GrpParseError::BufferTooSmall);
     }
     
     img.pixels.resize(header.width * header.height * 4);
@@ -237,7 +237,7 @@ GrpResult<ImageData> GrpParser::parse_dxt(std::span<const uint8_t> data,
                            (header.width * header.height / 2); // DXT1 估算
     
     if (data.size() < pixel_offset + expected_size) {
-        return std::unexpected(GrpParseError::BufferTooSmall);
+        return GrpResult<ImageData>::failure(GrpParseError::BufferTooSmall);
     }
     
     img.pixels.assign(data.begin() + pixel_offset, 
@@ -254,11 +254,11 @@ GrpResult<std::vector<uint8_t>> GrpParser::parse_palette(std::span<const uint8_t
     
     if (header.palette_offset == 0 || header.palette_size == 0) {
         // 无调色板或使用默认调色板
-        return std::unexpected(GrpParseError::CorruptedPalette);
+        return GrpResult<std::vector<uint8_t>>::failure(GrpParseError::CorruptedPalette);
     }
     
     if (data.size() < header.palette_offset + header.palette_size) {
-        return std::unexpected(GrpParseError::CorruptedPalette);
+        return GrpResult<std::vector<uint8_t>>::failure(GrpParseError::CorruptedPalette);
     }
     
     size_t entry_count = header.palette_size / 4; // 假设 RGBA 每项 4 字节
@@ -322,7 +322,7 @@ std::vector<std::pair<BinFileEntry, ImageData>> GrpParser::parse_all(const BinAr
         auto view_result = archive.view(entry);
         if (!view_result) continue;
         
-        auto img_result = parse(*view_result);
+        auto img_result = this->parse(*view_result);
         if (img_result) {
             results.emplace_back(entry, std::move(*img_result));
         } else {
@@ -339,7 +339,7 @@ GrpResult<ImageData> parse_image_from_entry(const BinArchive& archive,
                                              const BinFileEntry& entry) {
     auto view_result = archive.view(entry);
     if (!view_result) {
-        return std::unexpected(GrpParseError::InvalidHeader);
+        return GrpResult<ImageData>::failure(GrpParseError::InvalidHeader);
     }
     
     GrpParser parser;

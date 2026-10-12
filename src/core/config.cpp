@@ -7,139 +7,144 @@
 #include "filesystem.hpp"
 #include <fstream>
 #include <sstream>
+#include <variant>
 
 namespace tensyoki {
 
 bool Config::load(const std::string& filename) {
-    config_file_ = filename;
-    
-    // 尝试从多个位置加载
-    std::filesystem::path config_path;
-    std::vector<std::filesystem::path> search_paths = {
-        std::filesystem::current_path() / filename,
-        VFS::instance().get_user_data_dir() / filename,
-        "/etc/tensyoki/" / filename,
-    };
-    
-    for (const auto& p : search_paths) {
-        if (std::filesystem::exists(p)) {
-            config_path = p;
-            break;
-        }
-    }
-    
-    if (config_path.empty()) {
-        log_info("Config file not found, creating default: {}", filename);
+    std::filesystem::path path = filename;
+    if (!std::filesystem::exists(path)) {
         // 创建默认配置
         set_defaults();
         return save(filename);
     }
     
+    config_file_ = path;
+    
     try {
-        auto tbl = toml::parse_file(config_path.string());
+        std::ifstream file(path);
+        if (!file) {
+            LOG_ERROR("Failed to open config file: {}", path.string());
+            return false;
+        }
+        
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string content = buffer.str();
+        
+        toml::table tbl = toml::parse(content);
         load_table(tbl);
-        config_file_ = config_path;
-        log_info("Loaded config from: {}", config_path.string());
+        
+        LOG_INFO("Config loaded from: {}", path.string());
         return true;
-    } catch (const toml::parse_error& e) {
-        log_error("Failed to parse config: {}", e.what());
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to parse config: {}", e.what());
+        return false;
+    }
+}
+
+bool Config::save(const std::string& filename) const {
+    std::filesystem::path path = filename.empty() ? config_file_ : std::filesystem::path(filename);
+    if (path.empty()) {
+        LOG_ERROR("No config file path specified");
+        return false;
+    }
+    
+    try {
+        toml::table tbl;
+        save_table(tbl);
+        
+        std::ofstream file(path);
+        if (!file) {
+            LOG_ERROR("Failed to open config file for writing: {}", path.string());
+            return false;
+        }
+        
+        file << tbl;
+        
+        LOG_INFO("Config saved to: {}", path.string());
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to save config: {}", e.what());
         return false;
     }
 }
 
 void Config::load_table(const toml::table& tbl, const std::string& prefix) {
     for (const auto& [key, val] : tbl) {
-        std::string full_key = prefix.empty() ? key : prefix + "." + key;
+        std::string key_str = std::string(key.str());
+        std::string full_key = prefix.empty() ? key_str : prefix + "." + key_str;
         
         if (val.is_table()) {
             load_table(*val.as_table(), full_key);
-        } else if (val.is_array()) {
-            // 数组暂时存为字符串 (JSON 格式)
-            std::ostringstream oss;
-            oss << val;
-            values_[full_key] = oss.str();
-        } else if (val.is_string()) {
-            values_[full_key] = val.as_string()->get();
-        } else if (val.is_integer()) {
-            values_[full_key] = val.as_integer()->get();
-        } else if (val.is_floating()) {
-            values_[full_key] = val.as_floating()->get();
-        } else if (val.is_boolean()) {
-            values_[full_key] = val.as_boolean()->get();
+        } else {
+            // Convert toml::node to our variant type
+            std::shared_lock lock(mutex_);
+            if (val.is_string()) {
+                values_[full_key] = std::string(val.as_string()->get());
+            } else if (val.is_integer()) {
+                values_[full_key] = static_cast<int>(val.as_integer()->get());
+            } else if (val.is_floating_point()) {
+                values_[full_key] = static_cast<float>(val.as_floating_point()->get());
+            } else if (val.is_boolean()) {
+                values_[full_key] = val.as_boolean()->get();
+            }
+            // Skip arrays and other types for now
         }
-    }
-}
-
-bool Config::save(const std::string& filename) const {
-    std::filesystem::path path = filename.empty() ? config_file_ : filename;
-    if (path.empty()) {
-        path = VFS::instance().get_user_data_dir() / "config.toml";
-    }
-    
-    std::filesystem::create_directories(path.parent_path());
-    
-    toml::table tbl;
-    save_table(tbl);
-    
-    try {
-        std::ofstream ofs(path);
-        ofs << tbl;
-        log_info("Config saved to: {}", path.string());
-        return true;
-    } catch (const std::exception& e) {
-        log_error("Failed to save config: {}", e.what());
-        return false;
     }
 }
 
 void Config::save_table(toml::table& tbl) const {
     std::shared_lock lock(mutex_);
     
-    // 按前缀分组
-    std::map<std::string, toml::table*> groups;
-    
     for (const auto& [key, val] : values_) {
-        // 解析键路径
+        // Parse key path (e.g., "window.width")
         std::vector<std::string> parts;
         std::string part;
         for (char c : key) {
             if (c == '.') {
-                parts.push_back(part);
-                part.clear();
+                if (!part.empty()) {
+                    parts.push_back(part);
+                    part.clear();
+                }
             } else {
                 part += c;
             }
         }
         if (!part.empty()) parts.push_back(part);
         
-        // 创建嵌套表
+        if (parts.empty()) continue;
+        
+        // Navigate/create nested tables
         toml::table* current = &tbl;
         for (size_t i = 0; i < parts.size() - 1; ++i) {
-            auto& next = (*current)[parts[i]];
-            if (!next.is_table()) {
-                next = toml::table{};
+            const std::string& part = parts[i];
+            toml::node_view<toml::node> existing = (*current)[part];
+            
+            if (!existing) {
+                current->insert_or_assign(part, toml::table{});
             }
-            current = next.as_table();
+            current = (*current)[part].as_table();
         }
         
-        // 设置值
+        // Set the leaf value
         const std::string& leaf = parts.back();
         std::visit([&](const auto& v) {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, bool>) {
-                (*current)[leaf] = v;
+                current->insert_or_assign(leaf, v);
             } else if constexpr (std::is_same_v<T, int>) {
-                (*current)[leaf] = v;
+                current->insert_or_assign(leaf, v);
             } else if constexpr (std::is_same_v<T, int64_t>) {
-                (*current)[leaf] = v;
+                current->insert_or_assign(leaf, v);
             } else if constexpr (std::is_same_v<T, double>) {
-                (*current)[leaf] = v;
+                current->insert_or_assign(leaf, v);
             } else if constexpr (std::is_same_v<T, float>) {
-                (*current)[leaf] = v;
+                current->insert_or_assign(leaf, v);
             } else if constexpr (std::is_same_v<T, std::string>) {
-                (*current)[leaf] = v;
+                current->insert_or_assign(leaf, v);
             } else if constexpr (std::is_same_v<T, std::filesystem::path>) {
-                (*current)[leaf] = v.string();
+                current->insert_or_assign(leaf, v.string());
             }
         }, val);
     }
@@ -177,9 +182,6 @@ void Config::set_defaults() {
     // 输入
     set("input.mouse_sensitivity", 1.0f);
     set("input.invert_mouse", false);
-    set("input.gamepad_deadzone", 0.2f);
-    
-    dirty_ = true;
 }
 
 std::string Config::to_toml_string() const {
