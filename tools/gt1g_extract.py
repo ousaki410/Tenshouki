@@ -1,319 +1,319 @@
 #!/usr/bin/env python3
-"""gt1g_extract.py - 严格 GT1G 0600 纹理提取器
+"""Strict GT1G 0600 texture extractor for LINK containers (res/res_grp.bin etc.).
 
-用法:
-  python3 tools/gt1g_extract.py <link_file> <entry_index> [texture_index]
-  python3 tools/gt1g_extract.py <link_file> --list
-  python3 tools/gt1g_extract.py <link_file> --extract-all
+Usage:
+  gt1g_extract.py FILE --list [-v]
+  gt1g_extract.py FILE ENTRY [TEXTURE] --out DIR [--flip]
+  gt1g_extract.py FILE ENTRY --record N --out DIR [--scale K]
+  gt1g_extract.py FILE --all --out DIR
 
-只接受严格符合的 GT1G 0600 格式：
-- 顶层 LINK magic = "LINK"
-- 嵌套 entry 必须是 LINK magic
-- 嵌套 header: version=1, table_off=0x20, desc_off=0x40
-- 数据区 tag 必须为 "GT1G0600"
-- GT1G header: version=b"0600", field14=0, field18=0
-- Texture header: byte2 high nibble=log2(width), low nibble=log2(height)
-- 像素数据: 4 bytes/pixel (BGRA8888)
+Layout (see docs/formats/link.md and gt1g.md):
+  top level: 'LINK', count, 1, 0; entry table (offset, size) at 0x10
+  nested:    'LINK', 1, 0x20, n, 0x40; (data_off, data_size) at +0x20;
+             n descriptor records (u16 x, y, w, h; u32 texture index) at +0x40
+  GT1G:      'GT1G0600', total, header_size, count, 0, 0, count x u32, offset table,
+             then per texture a 20-byte entry header followed by pixel payload.
+  entry header byte 1 = format, byte 2 = size (low nibble log2 width, high nibble
+  log2 height), u32 at +8 = 0x0C.
 
-输出: 4 个 PNG (RGBA/BGRA × normal/flipped) 供目视比对
+Only format 0x01 (4 bytes per pixel) is decoded. Other formats are reported as
+unsupported. Pixel channel order is not decided: both BGRA and RGBA are written.
+Never commit the output; write it outside the repository with --out.
 """
-
+import argparse
+import os
 import struct
 import sys
-import os
-from pathlib import Path
-try:
-    from PIL import Image
-except ImportError:
-    print("需要安装 Pillow: pip install Pillow")
-    sys.exit(1)
+from collections import Counter
+from dataclasses import dataclass
+
+BPP = {0x01: 4}
+TEX_ENTRY_HEADER = 20
+MAX_TEXTURES = 64
+MAX_RECORDS = 100000
 
 
-def parse_top_level_link(f):
-    """解析顶层 LINK 文件，返回所有 entry 的 (base, outer_size)"""
-    f.seek(0)
-    magic = f.read(4)
-    if magic != b'LINK':
-        raise ValueError("不是有效的 LINK 文件")
-    count = struct.unpack('<I', f.read(4))[0]
-    
-    entries = []
-    for i in range(count):
-        base, outer_size = struct.unpack('<II', f.read(8))
-        entries.append((base, outer_size))
-    return entries
+class Gt1gError(Exception):
+    pass
 
 
-def read_entry_header(f, base):
-    """读取嵌套 entry 的 header (0x40 字节)"""
-    f.seek(base)
-    hdr_data = f.read(0x40)
-    if len(hdr_data) < 0x40 or hdr_data[:4] != b'LINK':
-        return None
-    ver, table_off, n, desc_off = struct.unpack_from('<4I', hdr_data, 4)
-    data_off, data_size = struct.unpack('<II', hdr_data[8:16])
-    return {
-        'version': ver,
-        'table_off': table_off,
-        'n': n,
-        'desc_off': desc_off,
-        'data_off': data_off,
-        'data_size': data_size,
-    }
+class NotNestedLink(Gt1gError):
+    pass
 
 
-def read_gt1g_header(f, offset):
-    """读取 GT1G header (0x1C bytes)"""
+@dataclass
+class Texture:
+    index: int
+    fmt: int
+    width: int
+    height: int
+    pixel_offset: int
+    payload_size: int
+
+    @property
+    def supported(self):
+        return self.fmt in BPP
+
+    @property
+    def bits_per_pixel(self):
+        return self.payload_size * 8 / (self.width * self.height)
+
+
+@dataclass
+class Nested:
+    base: int
+    size: int
+    n: int
+    desc_off: int
+    data_off: int
+    data_size: int
+
+
+@dataclass
+class Gt1g:
+    start: int
+    total: int
+    header_size: int
+    textures: list
+
+
+def read_exact(f, offset, size, what):
     f.seek(offset)
-    hdr = f.read(0x1C)
-    if len(hdr) < 0x1C:
-        return None
-    if hdr[:8] != b'GT1G0600':
-        return None
-    total, hsize, cnt = struct.unpack_from('<3I', hdr, 8)
-    f14, f18 = struct.unpack_from('<2I', hdr, 0x14)
-    if f14 != 0 or f18 != 0:
-        return None
-    return {
-        'total': total,
-        'header_size': hsize,
-        'count': cnt,
-    }
-
-
-def parse_texture_header(f, start, header_size, count, total_size):
-    """解析每个纹理的头部信息"""
-    f.seek(start + 0x1C)
-    flags = struct.unpack('<%dI' % count, f.read(4 * count))
-    f.seek(start + header_size)
-    offs = list(struct.unpack('<%dI' % count, f.read(4 * count)))
-    ends = list(offs[1:]) + [total_size - header_size]
-    
-    textures = []
-    for i, o in enumerate(offs):
-        f.seek(start + header_size + o)
-        t = f.read(20)
-        if len(t) < 20:
-            continue
-        b = t[:8]
-        ext = struct.unpack_from('<I', t, 8)[0]
-        span = ends[i] - o
-        byte1 = b[1]
-        byte2 = b[2]
-        w_log2 = byte2 >> 4
-        h_log2 = byte2 & 0xF
-        width = 1 << w_log2
-        height = 1 << h_log2
-        expected = width * height * 4
-        textures.append({
-            'index': i,
-            'offset': o,
-            'byte1': b[1],
-            'byte2': b[2],
-            'w_log2': w_log2,
-            'h_log2': h_log2,
-            'width': width,
-            'height': height,
-            'expected_size': expected,
-            'actual_span': span,
-            'ext': ext,
-            'head8': b.hex(),
-        })
-    return textures
-
-
-def extract_texture(f, start, texture, header_size):
-    """提取单个纹理的像素数据"""
-    expected = texture['width'] * texture['height'] * 4
-    actual = texture['actual_span']
-    
-    if actual != expected:
-        print(f"  Warning: texture {texture['index']} span=0x{texture['actual_span']:x} != expected 0x{expected:x}")
-    
-    f.seek(start + header_size + texture['offset'])
-    data = f.read(expected)
-    if len(data) < expected:
-        # 如果不够，读实际 span
-        f.seek(start + header_size + texture['offset'])
-        data = f.read(actual)
-    
+    data = f.read(size)
+    if len(data) != size:
+        raise Gt1gError(f'{what}: truncated at 0x{offset:x} (wanted {size}, got {len(data)})')
     return data
 
 
-def save_png_variants(data, width, height, out_prefix):
-    """保存 4 种变体: RGBA/BGRA × normal/flipped"""
-    variants = []
-    
-    # 1. BGRA -> RGBA (标准)
-    img = Image.frombytes('RGBA', (width, height), data, 'raw', 'BGRA')
-    img.save(f'{out_prefix}_bgra.png')
-    variants.append(f'{out_prefix}_bgra.png')
-    
-    # 2. BGRA + vertical flip
-    img = Image.frombytes('RGBA', (width, height), data, 'raw', 'BGRA')
-    img = img.transpose(Image.FLIP_TOP_BOTTOM)
-    img.save(f'{out_prefix}_bgra_flip.png')
-    variants.append(f'{out_prefix}_bgra_flip.png')
-    
-    # 3. RGBA 直写
-    img = Image.frombytes('RGBA', (width, height), data, 'raw', 'RGBA')
-    img.save(f'{out_prefix}_rgba.png')
-    variants.append(f'{out_prefix}_rgba.png')
-    
-    # 4. RGBA + vertical flip
-    img = Image.frombytes('RGBA', (width, height), data, 'raw', 'RGBA')
-    img = img.transpose(Image.FLIP_TOP_BOTTOM)
-    img.save(f'{out_prefix}_rgba_flip.png')
-    variants.append(f'{out_prefix}_rgba_flip.png')
-    
-    return variants
+def read_top_level(f, file_size):
+    head = read_exact(f, 0, 16, 'top header')
+    if head[:4] != b'LINK':
+        raise Gt1gError('not a LINK file')
+    count = struct.unpack_from('<I', head, 4)[0]
+    if count == 0 or 16 + 8 * count > file_size:
+        raise Gt1gError(f'bad entry count {count}')
+    raw = read_exact(f, 16, 8 * count, 'top table')
+    entries = []
+    for i in range(count):
+        off, size = struct.unpack_from('<II', raw, 8 * i)
+        if size and off + size > file_size:
+            raise Gt1gError(f'entry {i}: payload 0x{off:x}+0x{size:x} is beyond the end of the file')
+        entries.append((off, size))
+    return entries
 
 
-def extract_entry(file_path, base, outer_size, entry_idx, texture_idx=None):
-    """提取单个 entry 的纹理"""
-    with open(file_path, 'rb') as f:
-        f.seek(base)
-        hdr_data = f.read(0x40)
-        if len(hdr_data) < 0x40 or hdr_data[:4] != b'LINK':
-            print(f'Entry {entry_idx}: 不是嵌套 LINK (magic mismatch)')
-            return False
-        
-        ver, table_off, n, desc_off = struct.unpack_from('<4I', hdr_data, 4)
-        data_off, data_size = struct.unpack('<II', hdr_data[8:16])
-        
-        hdr = {
-            'version': ver,
-            'table_off': table_off,
-            'n': n,
-            'desc_off': desc_off,
-            'data_off': data_off,
-            'data_size': data_size,
-        }
-        
-        if hdr['version'] != 1:
-            print(f'Entry {entry_idx}: 版本 {hdr["version"]} != 1, 跳过')
-            return False
-        if hdr['table_off'] != 0x20:
-            print(f'Entry {entry_idx}: table_off=0x{hdr["table_off"]:x} != 0x20')
-            return False
-        if hdr['desc_off'] != 0x40:
-            print(f'Entry {entry_idx}: desc_off=0x{hdr["desc_off"]:x} != 0x40')
-            return False
-        
-        # 查找 GT1G0600 标签
-        f.seek(base)
-        entry_data = f.read(outer_size)
-        gt1g_offset = entry_data.find(b'GT1G0600')
-        if gt1g_offset < 0:
-            print(f'Entry {entry_idx}: 未找到 GT1G0600 tag')
-            return False
-        
-        gt1g_offset = base + gt1g_offset
-        f.seek(gt1g_offset)
-        tag = f.read(8)
-        if tag != b'GT1G0600':
-            print(f'Entry {entry_idx}: GT1G tag mismatch')
-            return False
-        
-        # 解析 GT1G header
-        gt1g = read_gt1g_header(f, gt1g_offset)
-        if gt1g is None:
-            print(f'Entry {entry_idx}: 无效 GT1G header')
-            return False
-        
-        if gt1g['count'] == 0 or gt1g['count'] > 64:
-            print(f'Entry {entry_idx}: 无效纹理数 {gt1g["count"]}')
-            return False
-        
-        # 解析纹理头部
-        textures = parse_texture_header(f, gt1g_offset, gt1g['header_size'], gt1g['count'], gt1g['total'])
-        
-        # 确定要提取的纹理
-        if texture_idx is not None:
-            if texture_idx >= len(textures):
-                print(f'Texture index {texture_idx} 超出范围 (0-{len(textures)-1})')
-                return False
-            textures = [textures[texture_idx]]
-        
-        # 提取每个纹理
-        for tex in textures:
-            if tex['actual_span'] != tex['expected_size']:
-                print(f"  Texture {tex['index']}: span=0x{tex['actual_span']:x} != expected 0x{tex['expected_size']:x} (可能不匹配)")
-            
-            # 提取像素数据
-            pixel_offset = gt1g_offset + gt1g['header_size'] + tex['offset']
-            f.seek(pixel_offset)
-            data = f.read(tex['expected_size'])
-            if len(data) < tex['expected_size']:
-                # 如果不够，读实际 span
-                f.seek(pixel_offset)
-                data = f.read(tex['actual_span'])
-            
-            # 保存 4 种变体
-            out_prefix = f'extracted_e{entry_idx}_t{tex["index"]}_{tex["width"]}x{tex["height"]}'
-            variants = save_png_variants(data, tex['width'], tex['height'], out_prefix)
-            print(f'Extracted: {out_prefix} ({tex["width"]}x{tex["height"]}) -> {variants}')
-        
-        return True
+def read_nested(f, index, base, size):
+    if size < 0x40:
+        raise NotNestedLink(f'entry {index}: payload too small ({size} bytes)')
+    head = read_exact(f, base, 0x28, f'entry {index} nested header')
+    if head[:4] != b'LINK':
+        raise NotNestedLink(f'entry {index}: first bytes {head[:4]!r}, not LINK')
+    ver, table_off, n, desc_off = struct.unpack_from('<4I', head, 4)
+    if (ver, table_off, desc_off) != (1, 0x20, 0x40):
+        raise NotNestedLink(
+            f'entry {index}: LINK with unsupported layout (v={ver}, table=0x{table_off:x}, desc=0x{desc_off:x})')
+    data_off, data_size = struct.unpack_from('<II', head, 0x20)
+    if n == 0 or n > MAX_RECORDS:
+        raise Gt1gError(f'entry {index}: bad record count {n}')
+    if data_off < desc_off + 12 * n:
+        raise Gt1gError(f'entry {index}: data starts at 0x{data_off:x}, inside the descriptor table')
+    if data_off + data_size != size:
+        raise Gt1gError(
+            f'entry {index}: data 0x{data_off:x}+0x{data_size:x} does not end at payload size 0x{size:x}')
+    return Nested(base, size, n, desc_off, data_off, data_size)
 
 
-def list_entries(file_path):
-    """列出所有顶层 entry"""
-    with open(file_path, 'rb') as f:
-        entries = parse_top_level_link(f)
-    
-    print(f'Top-level entries: {len(entries)}')
-    for i, (base, outer_size) in enumerate(entries):
-        with open(file_path, 'rb') as f:
-            f.seek(base)
-            hdr_data = f.read(0x40)
-            if len(hdr_data) >= 0x40 and hdr_data[:4] == b'LINK':
-                ver, table_off, n, desc_off = struct.unpack_from('<4I', hdr_data, 4)
-                data_off, data_size = struct.unpack('<II', hdr_data[8:16])
-                print(f'  [{i}] base=0x{base:x} outer=0x{outer_size:x} ver={ver} n={n} data_off=0x{data_off:x} size=0x{data_size:x}')
-            else:
-                print(f'  [{i}] base=0x{base:x} outer=0x{outer_size:x} (not nested LINK)')
+def read_descriptors(f, nested):
+    raw = read_exact(f, nested.base + nested.desc_off, 12 * nested.n, 'descriptor table')
+    return [struct.unpack_from('<HHHHI', raw, 12 * i) for i in range(nested.n)]
+
+
+def read_gt1g(f, nested):
+    start = nested.base + nested.data_off
+    head = read_exact(f, start, 0x1C, 'GT1G header')
+    if head[:8] != b'GT1G0600':
+        raise Gt1gError(f'bad GT1G tag {head[:8]!r}')
+    total, hsize, count = struct.unpack_from('<3I', head, 8)
+    f14, f18 = struct.unpack_from('<2I', head, 0x14)
+    if total != nested.data_size:
+        raise Gt1gError(f'GT1G total 0x{total:x} != nested data size 0x{nested.data_size:x}')
+    if count < 1 or count > MAX_TEXTURES:
+        raise Gt1gError(f'bad texture count {count}')
+    if hsize != 0x1C + 4 * count:
+        raise Gt1gError(f'GT1G header_size 0x{hsize:x} != 0x{0x1C + 4 * count:x}')
+    if f14 != 0 or f18 != 0:
+        raise Gt1gError(f'unexpected header fields {f14}, {f18}')
+    raw = read_exact(f, start + hsize, 4 * count, 'texture offset table')
+    offs = list(struct.unpack('<%dI' % count, raw))
+    if offs[0] != 4 * count:
+        raise Gt1gError(f'first texture offset 0x{offs[0]:x} != 0x{4 * count:x}')
+    body = total - hsize
+    ends = offs[1:] + [body]
+    textures = []
+    for i, (o, e) in enumerate(zip(offs, ends)):
+        if not o < e <= body:
+            raise Gt1gError(f'texture {i}: bad range 0x{o:x}..0x{e:x} (body 0x{body:x})')
+        span = e - o
+        if span < TEX_ENTRY_HEADER:
+            raise Gt1gError(f'texture {i}: span {span} smaller than its header')
+        entry = start + hsize + o
+        t = read_exact(f, entry, TEX_ENTRY_HEADER, f'texture {i} header')
+        ext = struct.unpack_from('<I', t, 8)[0]
+        if ext != 0x0C:
+            raise Gt1gError(f'texture {i}: extra header size 0x{ext:x} != 0x0c')
+        fmt = t[1]
+        width = 1 << (t[2] & 0xF)
+        height = 1 << (t[2] >> 4)
+        payload = span - TEX_ENTRY_HEADER
+        if fmt in BPP and payload != width * height * BPP[fmt]:
+            raise Gt1gError(
+                f'texture {i}: payload {payload} != {width}x{height}x{BPP[fmt]} for format 0x{fmt:02x}')
+        textures.append(Texture(i, fmt, width, height, entry + TEX_ENTRY_HEADER, payload))
+    return Gt1g(start, total, hsize, textures)
+
+
+def load_entry(f, index, base, size):
+    nested = read_nested(f, index, base, size)
+    return nested, read_gt1g(f, nested)
+
+
+def descriptor_issues(textures, records):
+    issues = []
+    for i, (x, y, w, h, last) in enumerate(records):
+        if last >= len(textures):
+            issues.append((i, f'texture index {last} out of range'))
+            continue
+        t = textures[last]
+        if x + w > t.width or y + h > t.height:
+            issues.append((i, f'rect {x},{y},{w},{h} exceeds texture {last} ({t.width}x{t.height})'))
+    return issues
+
+
+def decode_image(data, width, height, order):
+    from PIL import Image
+    return Image.frombytes('RGBA', (width, height), data, 'raw', order)
+
+
+def save_variants(data, tex, out_dir, name, crop, scale, flip):
+    from PIL import Image
+    written = 0
+    for order in ('BGRA', 'RGBA'):
+        img = decode_image(data, tex.width, tex.height, order)
+        if crop:
+            img = img.crop(crop)
+        if scale > 1:
+            img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+        variants = [('', img)]
+        if flip:
+            variants.append(('_flip', img.transpose(Image.FLIP_TOP_BOTTOM)))
+        for suffix, im in variants:
+            im.save(os.path.join(out_dir, f'{name}_{order.lower()}{suffix}.png'))
+            written += 1
+    return written
+
+
+def cmd_list(f, entries, verbose):
+    for idx, (base, size) in enumerate(entries):
+        try:
+            nested, gt = load_entry(f, idx, base, size)
+            records = read_descriptors(f, nested)
+        except NotNestedLink as exc:
+            print(f'[{idx}] skip: {exc}')
+            continue
+        except Gt1gError as exc:
+            print(f'[{idx}] INVALID: {exc}')
+            continue
+        fmts = Counter(t.fmt for t in gt.textures)
+        fmt_s = ', '.join(f'0x{k:02x}:{v}' for k, v in sorted(fmts.items()))
+        issues = descriptor_issues(gt.textures, records)
+        print(f'[{idx}] textures={len(gt.textures)} records={len(records)} formats=[{fmt_s}] descriptor_issues={len(issues)}')
+        if verbose:
+            for t in gt.textures:
+                print(f'    tex {t.index}: fmt=0x{t.fmt:02x} {t.width}x{t.height} payload={t.payload_size} bpp={t.bits_per_pixel:g}')
+            for i, why in issues[:10]:
+                print(f'    record {i}: {why}')
     return 0
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
+def cmd_extract(f, entries, args):
+    if not args.out:
+        print('--out DIR is required for extraction', file=sys.stderr)
         return 2
-    
-    file_path = sys.argv[1]
-    
-    if not os.path.exists(file_path):
-        print(f'文件不存在: {file_path}')
+    os.makedirs(args.out, exist_ok=True)
+    explicit = args.entry is not None
+    indices = [args.entry] if explicit else range(len(entries))
+    written = unsupported = skipped = 0
+    status = 0
+    for idx in indices:
+        base, size = entries[idx]
+        try:
+            nested, gt = load_entry(f, idx, base, size)
+            records = read_descriptors(f, nested)
+        except Gt1gError as exc:
+            print(f'[{idx}] skipped: {exc}', file=sys.stderr)
+            skipped += 1
+            status = 1 if explicit else status
+            continue
+        picks, crop, label = list(gt.textures), None, None
+        if args.record is not None:
+            if not 0 <= args.record < len(records):
+                print(f'[{idx}] record {args.record} out of range (0-{len(records) - 1})', file=sys.stderr)
+                return 1
+            x, y, w, h, last = records[args.record]
+            if last >= len(gt.textures):
+                print(f'[{idx}] record {args.record}: texture index {last} out of range', file=sys.stderr)
+                return 1
+            picks, crop, label = [gt.textures[last]], (x, y, x + w, y + h), f'r{args.record}'
+        elif args.texture is not None:
+            if not 0 <= args.texture < len(gt.textures):
+                print(f'[{idx}] texture {args.texture} out of range (0-{len(gt.textures) - 1})', file=sys.stderr)
+                return 1
+            picks = [gt.textures[args.texture]]
+        for tex in picks:
+            if not tex.supported:
+                print(f'[{idx}] texture {tex.index}: unsupported format 0x{tex.fmt:02x} '
+                      f'({tex.width}x{tex.height}, {tex.bits_per_pixel:g} bits/pixel), not written')
+                unsupported += 1
+                if args.texture is not None or args.record is not None:
+                    status = 3
+                continue
+            if crop and (crop[2] > tex.width or crop[3] > tex.height):
+                print(f'[{idx}] crop {crop} exceeds texture {tex.index} ({tex.width}x{tex.height})', file=sys.stderr)
+                status = 1
+                continue
+            data = read_exact(f, tex.pixel_offset, tex.payload_size, f'texture {tex.index} pixels')
+            name = f'e{idx}_{label + "_" if label else ""}t{tex.index}_{tex.width}x{tex.height}'
+            written += save_variants(data, tex, args.out, name, crop, args.scale, args.flip)
+    print(f'written={written} unsupported={unsupported} skipped_entries={skipped}')
+    return status
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Strict GT1G 0600 texture extractor')
+    ap.add_argument('file')
+    ap.add_argument('entry', nargs='?', type=int)
+    ap.add_argument('texture', nargs='?', type=int)
+    ap.add_argument('--list', action='store_true')
+    ap.add_argument('--all', action='store_true')
+    ap.add_argument('-v', '--verbose', action='store_true')
+    ap.add_argument('--out')
+    ap.add_argument('--record', type=int)
+    ap.add_argument('--scale', type=int, default=1)
+    ap.add_argument('--flip', action='store_true')
+    args = ap.parse_args(argv)
+    try:
+        file_size = os.path.getsize(args.file)
+        with open(args.file, 'rb') as f:
+            entries = read_top_level(f, file_size)
+            if args.list or (args.entry is None and not args.all):
+                return cmd_list(f, entries, args.verbose)
+            if args.entry is not None and not 0 <= args.entry < len(entries):
+                print(f'entry {args.entry} out of range (0-{len(entries) - 1})', file=sys.stderr)
+                return 1
+            return cmd_extract(f, entries, args)
+    except Gt1gError as exc:
+        print(f'error: {exc}', file=sys.stderr)
         return 1
-    
-    with open(file_path, 'rb') as f:
-        entries = parse_top_level_link(f)
-    
-    if len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2] == '--list'):
-        return list_entries(file_path)
-    
-    if len(sys.argv) < 3:
-        print(__doc__)
-        return 2
-    
-    if sys.argv[2] == '--list':
-        return list_entries(file_path)
-    
-    if sys.argv[2] == '--extract-all':
-        for i in range(len(entries)):
-            extract_entry(file_path, entries[i][0], entries[i][1], i)
-        return 0
-    
-    entry_idx = int(sys.argv[2])
-    texture_idx = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    
-    if entry_idx >= len(entries):
-        print(f'Entry index {entry_idx} 超出范围 (0-{len(entries)-1})')
-        return 1
-    
-    success = extract_entry(file_path, entries[entry_idx][0], entries[entry_idx][1], entry_idx, texture_idx)
-    return 0 if success else 1
 
 
 if __name__ == '__main__':
