@@ -79,11 +79,22 @@ class Gt1gExtractTests(unittest.TestCase):
         self.assertEqual(g.read_exact(f, t1.pixel_offset, t1.payload_size, 'p'), p1)
 
     def test_unsupported_format_is_reported_not_rejected(self):
-        _, _, _, gt = parse(make_blob([(0x08, 3, 2, bytes(32))]))
+        _, _, _, gt = parse(make_blob([(0x0F, 3, 2, bytes(32))]))
         t = gt.textures[0]
         self.assertFalse(t.supported)
         self.assertEqual((t.width, t.height), (8, 4))
         self.assertEqual(t.bits_per_pixel, 8)
+
+    def test_block_formats_are_supported_and_sized(self):
+        _, _, _, gt = parse(make_blob([(0x06, 3, 2, bytes(16)), (0x08, 3, 2, bytes(32))]))
+        self.assertTrue(all(t.supported for t in gt.textures))
+        self.assertEqual([t.bits_per_pixel for t in gt.textures], [4, 8])
+
+    def test_block_payload_size_mismatch_is_rejected(self):
+        with self.assertRaises(g.Gt1gError):
+            parse(make_blob([(0x08, 3, 2, bytes(31))]))
+        with self.assertRaises(g.Gt1gError):
+            parse(make_blob([(0x06, 3, 2, bytes(32))]))
 
     def test_span_mismatch_is_rejected(self):
         with self.assertRaises(g.Gt1gError):
@@ -126,6 +137,16 @@ class Gt1gExtractTests(unittest.TestCase):
         data = bytes([1, 2, 3, 255])
         self.assertEqual(g.decode_image(data, 1, 1, 'BGRA').getpixel((0, 0)), (3, 2, 1, 255))
         self.assertEqual(g.decode_image(data, 1, 1, 'RGBA').getpixel((0, 0)), (1, 2, 3, 255))
+
+    def test_bc1_and_bc3_decode_solid_red(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest('Pillow not installed')
+        color = struct.pack('<HHI', 0xF800, 0x0000, 0)
+        bc3_alpha = bytes([255, 0]) + bytes(6)
+        self.assertEqual(g.decode_bc(color, 4, 4, 0x06).getpixel((0, 0)), (255, 0, 0, 255))
+        self.assertEqual(g.decode_bc(bc3_alpha + color, 4, 4, 0x08).getpixel((3, 3)), (255, 0, 0, 255))
 
 
 if __name__ == '__main__':

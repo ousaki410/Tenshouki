@@ -6,7 +6,6 @@ Usage:
   gt1g_extract.py FILE ENTRY [TEXTURE] --out DIR [--flip]
   gt1g_extract.py FILE ENTRY --record N --out DIR [--scale K]
   gt1g_extract.py FILE --all --out DIR
-  gt1g_extract.py FILE ENTRY [TEXTURE] --out DIR --probe-bc
 
 Layout (see docs/formats/link.md and gt1g.md):
   top level: 'LINK', count, 1, 0; entry table (offset, size) at 0x10
@@ -17,14 +16,13 @@ Layout (see docs/formats/link.md and gt1g.md):
   entry header byte 1 = format, byte 2 = size (low nibble log2 width, high nibble
   log2 height), u32 at +8 = 0x0C.
 
-Only format 0x01 (4 bytes per pixel) is decoded. Other formats are reported as
-unsupported. Pixel channel order is BGRA (confirmed by eye on entry 0 artwork).
-
---probe-bc is an experiment, not a decoder: for unsupported formats whose size
-matches block compression (0x06 = 0.5 byte/pixel, 0x08 = 1 byte/pixel) it wraps
-the payload in a DDS header and lets Pillow decode it as BC1, BC3, BC5 and BC7,
-writing one PNG per candidate. Look at the PNGs to see which one is right.
-Exit codes are unchanged by the probe.
+Formats:
+  0x01  raw 4 bytes per pixel, BGRA (confirmed by eye on entry 0 artwork)
+  0x06  BC1 (0.5 byte per pixel), confirmed by eye on entry 6 (map)
+  0x08  BC3 (1 byte per pixel), confirmed by eye on entry 19 (artwork)
+Anything else is reported as unsupported. BC data is decoded through Pillow's DDS
+reader. Textures are padded to powers of two; use --record to crop the real image
+out of the padding (the descriptor record holds the true x, y, w, h).
 
 Never commit the output; write it outside the repository with --out.
 """
@@ -37,17 +35,16 @@ from collections import Counter
 from dataclasses import dataclass
 
 BPP = {0x01: 4}
+# format byte -> (label, bytes per 4x4 block, DXGI format, legacy FourCC or None)
+# Pillow does not implement DXGI 77 (BC3) inside a DX10 header, so BC3 uses DXT5.
+BLOCK = {
+    0x06: ('bc1', 8, 71, None),
+    0x08: ('bc3', 16, 77, b'DXT5'),
+}
 CHANNEL_ORDER = 'BGRA'
 TEX_ENTRY_HEADER = 20
 MAX_TEXTURES = 64
 MAX_RECORDS = 100000
-
-# format byte -> [(label, DXGI format, bytes per 4x4 block, legacy FourCC or None)]
-# Pillow does not implement DXGI 77 (BC3) inside a DX10 header, so BC3 uses DXT5.
-PROBES = {
-    0x06: [('bc1', 71, 8, None)],
-    0x08: [('bc3', 77, 16, b'DXT5'), ('bc5', 83, 16, None), ('bc7', 98, 16, None)],
-}
 
 
 class Gt1gError(Exception):
@@ -69,7 +66,7 @@ class Texture:
 
     @property
     def supported(self):
-        return self.fmt in BPP
+        return self.fmt in BPP or self.fmt in BLOCK
 
     @property
     def bits_per_pixel(self):
@@ -92,6 +89,14 @@ class Gt1g:
     total: int
     header_size: int
     textures: list
+
+
+def expected_payload(fmt, width, height):
+    if fmt in BPP:
+        return width * height * BPP[fmt]
+    if fmt in BLOCK:
+        return ((width + 3) // 4) * ((height + 3) // 4) * BLOCK[fmt][1]
+    return None
 
 
 def read_exact(f, offset, size, what):
@@ -182,9 +187,10 @@ def read_gt1g(f, nested):
         width = 1 << (t[2] & 0xF)
         height = 1 << (t[2] >> 4)
         payload = span - TEX_ENTRY_HEADER
-        if fmt in BPP and payload != width * height * BPP[fmt]:
+        want = expected_payload(fmt, width, height)
+        if want is not None and payload != want:
             raise Gt1gError(
-                f'texture {i}: payload {payload} != {width}x{height}x{BPP[fmt]} for format 0x{fmt:02x}')
+                f'texture {i}: payload {payload} != {want} for {width}x{height} format 0x{fmt:02x}')
         textures.append(Texture(i, fmt, width, height, entry + TEX_ENTRY_HEADER, payload))
     return Gt1g(start, total, hsize, textures)
 
@@ -221,31 +227,22 @@ def build_dds(width, height, dxgi, data, fourcc=None):
     return header + data
 
 
-def probe_bc(data, tex, out_dir, name):
+def decode_bc(data, width, height, fmt):
     from PIL import Image
-    written = 0
-    if tex.width % 4 or tex.height % 4:
-        print(f'  probe: {name}: size {tex.width}x{tex.height} is not a multiple of 4, skipped')
-        return 0
-    blocks = (tex.width // 4) * (tex.height // 4)
-    for label, dxgi, block, fourcc in PROBES.get(tex.fmt, []):
-        if blocks * block != len(data):
-            print(f'  probe: {name}_{label}: payload {len(data)} != {blocks}x{block}, skipped')
-            continue
-        try:
-            img = Image.open(io.BytesIO(build_dds(tex.width, tex.height, dxgi, data, fourcc)))
-            img = img.convert('RGBA')
-            img.save(os.path.join(out_dir, f'{name}_{label}.png'))
-            written += 1
-        except Exception as exc:
-            print(f'  probe: {name}_{label}: Pillow could not decode ({exc})')
-    return written
+    _, _, dxgi, fourcc = BLOCK[fmt]
+    img = Image.open(io.BytesIO(build_dds(width, height, dxgi, data, fourcc)))
+    return img.convert('RGBA')
 
 
 def save_variants(data, tex, out_dir, name, crop, scale, flip):
     from PIL import Image
     written = 0
-    img = decode_image(data, tex.width, tex.height, CHANNEL_ORDER)
+    if tex.fmt in BLOCK:
+        img = decode_bc(data, tex.width, tex.height, tex.fmt)
+        label = BLOCK[tex.fmt][0]
+    else:
+        img = decode_image(data, tex.width, tex.height, CHANNEL_ORDER)
+        label = CHANNEL_ORDER.lower()
     if crop:
         img = img.crop(crop)
     if scale > 1:
@@ -254,7 +251,7 @@ def save_variants(data, tex, out_dir, name, crop, scale, flip):
     if flip:
         variants.append(('_flip', img.transpose(Image.FLIP_TOP_BOTTOM)))
     for suffix, im in variants:
-        im.save(os.path.join(out_dir, f'{name}_{CHANNEL_ORDER.lower()}{suffix}.png'))
+        im.save(os.path.join(out_dir, f'{name}_{label}{suffix}.png'))
         written += 1
     return written
 
@@ -289,7 +286,7 @@ def cmd_extract(f, entries, args):
     os.makedirs(args.out, exist_ok=True)
     explicit = args.entry is not None
     indices = [args.entry] if explicit else range(len(entries))
-    written = unsupported = skipped = probed = 0
+    written = unsupported = skipped = 0
     status = 0
     for idx in indices:
         base, size = entries[idx]
@@ -321,9 +318,6 @@ def cmd_extract(f, entries, args):
                 print(f'[{idx}] texture {tex.index}: unsupported format 0x{tex.fmt:02x} '
                       f'({tex.width}x{tex.height}, {tex.bits_per_pixel:g} bits/pixel), not written')
                 unsupported += 1
-                if args.probe_bc and tex.fmt in PROBES:
-                    data = read_exact(f, tex.pixel_offset, tex.payload_size, f'texture {tex.index} pixels')
-                    probed += probe_bc(data, tex, args.out, f'e{idx}_t{tex.index}_{tex.width}x{tex.height}_f{tex.fmt:02x}')
                 if args.texture is not None or args.record is not None:
                     status = 3
                 continue
@@ -334,10 +328,7 @@ def cmd_extract(f, entries, args):
             data = read_exact(f, tex.pixel_offset, tex.payload_size, f'texture {tex.index} pixels')
             name = f'e{idx}_{label + "_" if label else ""}t{tex.index}_{tex.width}x{tex.height}'
             written += save_variants(data, tex, args.out, name, crop, args.scale, args.flip)
-    summary = f'written={written} unsupported={unsupported} skipped_entries={skipped}'
-    if args.probe_bc:
-        summary += f' probe_pngs={probed}'
-    print(summary)
+    print(f'written={written} unsupported={unsupported} skipped_entries={skipped}')
     return status
 
 
@@ -353,8 +344,6 @@ def main(argv=None):
     ap.add_argument('--record', type=int)
     ap.add_argument('--scale', type=int, default=1)
     ap.add_argument('--flip', action='store_true')
-    ap.add_argument('--probe-bc', action='store_true',
-                    help='experiment: decode formats 0x06/0x08 as BC1/BC3/BC5/BC7 candidates via Pillow')
     args = ap.parse_args(argv)
     try:
         file_size = os.path.getsize(args.file)
