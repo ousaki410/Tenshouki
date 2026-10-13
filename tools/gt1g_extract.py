@@ -22,8 +22,8 @@ unsupported. Pixel channel order is BGRA (confirmed by eye on entry 0 artwork).
 
 --probe-bc is an experiment, not a decoder: for unsupported formats whose size
 matches block compression (0x06 = 0.5 byte/pixel, 0x08 = 1 byte/pixel) it wraps
-the payload in a DX10 DDS header and lets Pillow decode it as BC1, BC3, BC5 and
-BC7, writing one PNG per candidate. Look at the PNGs to see which one is right.
+the payload in a DDS header and lets Pillow decode it as BC1, BC3, BC5 and BC7,
+writing one PNG per candidate. Look at the PNGs to see which one is right.
 Exit codes are unchanged by the probe.
 
 Never commit the output; write it outside the repository with --out.
@@ -42,10 +42,11 @@ TEX_ENTRY_HEADER = 20
 MAX_TEXTURES = 64
 MAX_RECORDS = 100000
 
-# format byte -> [(label, DXGI format, bytes per 4x4 block)]
+# format byte -> [(label, DXGI format, bytes per 4x4 block, legacy FourCC or None)]
+# Pillow does not implement DXGI 77 (BC3) inside a DX10 header, so BC3 uses DXT5.
 PROBES = {
-    0x06: [('bc1', 71, 8)],
-    0x08: [('bc3', 77, 16), ('bc5', 83, 16), ('bc7', 98, 16)],
+    0x06: [('bc1', 71, 8, None)],
+    0x08: [('bc3', 77, 16, b'DXT5'), ('bc5', 83, 16, None), ('bc7', 98, 16, None)],
 }
 
 
@@ -210,12 +211,13 @@ def decode_image(data, width, height, order=CHANNEL_ORDER):
     return Image.frombytes('RGBA', (width, height), data, 'raw', order)
 
 
-def build_dds(width, height, dxgi, data):
+def build_dds(width, height, dxgi, data, fourcc=None):
     header = struct.pack('<4s7I', b'DDS ', 124, 0x81007, height, width, len(data), 0, 1)
     header += b'\0' * 44
-    header += struct.pack('<II4s5I', 32, 4, b'DX10', 0, 0, 0, 0, 0)
+    header += struct.pack('<II4s5I', 32, 4, fourcc or b'DX10', 0, 0, 0, 0, 0)
     header += struct.pack('<5I', 0x1000, 0, 0, 0, 0)
-    header += struct.pack('<5I', dxgi, 3, 0, 1, 0)
+    if not fourcc:
+        header += struct.pack('<5I', dxgi, 3, 0, 1, 0)
     return header + data
 
 
@@ -226,12 +228,12 @@ def probe_bc(data, tex, out_dir, name):
         print(f'  probe: {name}: size {tex.width}x{tex.height} is not a multiple of 4, skipped')
         return 0
     blocks = (tex.width // 4) * (tex.height // 4)
-    for label, dxgi, block in PROBES.get(tex.fmt, []):
+    for label, dxgi, block, fourcc in PROBES.get(tex.fmt, []):
         if blocks * block != len(data):
             print(f'  probe: {name}_{label}: payload {len(data)} != {blocks}x{block}, skipped')
             continue
         try:
-            img = Image.open(io.BytesIO(build_dds(tex.width, tex.height, dxgi, data)))
+            img = Image.open(io.BytesIO(build_dds(tex.width, tex.height, dxgi, data, fourcc)))
             img = img.convert('RGBA')
             img.save(os.path.join(out_dir, f'{name}_{label}.png'))
             written += 1
