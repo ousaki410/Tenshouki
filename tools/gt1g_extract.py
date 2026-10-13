@@ -17,7 +17,7 @@ Layout (see docs/formats/link.md and gt1g.md):
   log2 height), u32 at +8 = 0x0C.
 
 Only format 0x01 (4 bytes per pixel) is decoded. Other formats are reported as
-unsupported. Pixel channel order is not decided: both BGRA and RGBA are written.
+unsupported. Pixel channel order is BGRA (confirmed by eye on entry 0 artwork).
 Never commit the output; write it outside the repository with --out.
 """
 import argparse
@@ -28,6 +28,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 BPP = {0x01: 4}
+CHANNEL_ORDER = 'BGRA'
 TEX_ENTRY_HEADER = 20
 MAX_TEXTURES = 64
 MAX_RECORDS = 100000
@@ -189,7 +190,7 @@ def descriptor_issues(textures, records):
     return issues
 
 
-def decode_image(data, width, height, order):
+def decode_image(data, width, height, order=CHANNEL_ORDER):
     from PIL import Image
     return Image.frombytes('RGBA', (width, height), data, 'raw', order)
 
@@ -197,18 +198,17 @@ def decode_image(data, width, height, order):
 def save_variants(data, tex, out_dir, name, crop, scale, flip):
     from PIL import Image
     written = 0
-    for order in ('BGRA', 'RGBA'):
-        img = decode_image(data, tex.width, tex.height, order)
-        if crop:
-            img = img.crop(crop)
-        if scale > 1:
-            img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
-        variants = [('', img)]
-        if flip:
-            variants.append(('_flip', img.transpose(Image.FLIP_TOP_BOTTOM)))
-        for suffix, im in variants:
-            im.save(os.path.join(out_dir, f'{name}_{order.lower()}{suffix}.png'))
-            written += 1
+    img = decode_image(data, tex.width, tex.height, CHANNEL_ORDER)
+    if crop:
+        img = img.crop(crop)
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    variants = [('', img)]
+    if flip:
+        variants.append(('_flip', img.transpose(Image.FLIP_TOP_BOTTOM)))
+    for suffix, im in variants:
+        im.save(os.path.join(out_dir, f'{name}_{CHANNEL_ORDER.lower()}{suffix}.png'))
+        written += 1
     return written
 
 
@@ -311,6 +311,9 @@ def main(argv=None):
                 print(f'entry {args.entry} out of range (0-{len(entries) - 1})', file=sys.stderr)
                 return 1
             return cmd_extract(f, entries, args)
+    except OSError as exc:
+        print(f'error: cannot read {args.file!r}: {exc.strerror or exc}', file=sys.stderr)
+        return 1
     except Gt1gError as exc:
         print(f'error: {exc}', file=sys.stderr)
         return 1
